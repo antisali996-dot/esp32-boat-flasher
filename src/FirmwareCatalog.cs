@@ -52,6 +52,7 @@ namespace BoatTool
         public int PulseMaxUs = -1;
         public int PairProtocol = -1;
         public int TargetRpm = -1;
+        public int OverspeedRpm = -1;
         public Dictionary<BoardRole, FirmwareSpec> Roles = new Dictionary<BoardRole, FirmwareSpec>();
         public List<string> Problems = new List<string>();
 
@@ -83,6 +84,7 @@ namespace BoatTool
                 catalog.PulseMaxUs = Json.GetInt(root, "pulse_max_us", -1);
                 catalog.PairProtocol = Json.GetInt(root, "pair_protocol", -1);
                 catalog.TargetRpm = Json.GetInt(root, "target_rpm", -1);
+                catalog.OverspeedRpm = Json.GetInt(root, "overspeed_rpm", -1);
 
                 object rolesValue;
                 if (root.TryGetValue("roles", out rolesValue))
@@ -122,19 +124,19 @@ namespace BoatTool
         private void SelfCheck()
         {
             if (Schema < 3) Problems.Add("固件清单版本过旧（schema=" + Schema + "），请使用本包配套文件");
-            if (SteerDeg >= 0 && SteerDeg != 20) Problems.Add("固件清单声明的转向角不是 20°：" + SteerDeg);
-            if (AngleMin >= 0 && AngleMax >= 0 && (AngleMax - AngleMin) != 2 * SteerDeg)
+            if (SteerDeg >= 0 && AngleMin >= 0 && AngleMax >= 0 && (AngleMax - AngleMin) != 2 * SteerDeg)
                 Problems.Add("固件清单角度范围与转向角不自洽：" + AngleMin + "～" + AngleMax);
+            if (TargetRpm <= 0) Problems.Add("固件清单没有声明目标转速 target_rpm");
             foreach (KeyValuePair<BoardRole, FirmwareSpec> pair in Roles)
             {
                 FirmwareSpec spec = pair.Value;
                 string label = RoleNames.Chinese(spec.Role);
                 if (string.IsNullOrEmpty(spec.Fwid)) { Problems.Add(label + "固件缺少 FWID"); continue; }
-                // 身份串必须自称 20° 契约（S20-A<min>-<max>），否则不允许发给用户。
-                string expected = "S20-A" + (AngleMin >= 0 ? AngleMin.ToString(CultureInfo.InvariantCulture) : "") + "-";
-                if (AngleMin >= 0 && !spec.Fwid.Contains(expected))
-                    Problems.Add(label + "固件身份不含 20° 角度契约：" + spec.Fwid);
-                if (spec.SteerDeg != 20) Problems.Add(label + "固件角色声明的转向角不是 20°");
+                // 身份串必须自称本清单声明的角度契约，否则不允许交给用户。
+                string expected = "S" + spec.SteerDeg + "-A" + AngleMin + "-" + AngleMax;
+                if (AngleMin >= 0 && spec.SteerDeg > 0 && !spec.Fwid.Contains(expected))
+                    Problems.Add(label + "固件身份不含清单声明的角度契约（" + expected + "）：" + spec.Fwid);
+                if (spec.SteerDeg <= 0) Problems.Add(label + "固件角色缺少转向角声明");
                 foreach (KeyValuePair<long, string> image in spec.Images())
                 {
                     if (image.Key < 0) { Problems.Add(label + "固件镜像缺少写入地址"); continue; }
@@ -146,15 +148,30 @@ namespace BoatTool
             }
             if (!Roles.ContainsKey(BoardRole.Boat)) Problems.Add("固件清单缺少小船固件");
             if (!Roles.ContainsKey(BoardRole.Remote)) Problems.Add("固件清单缺少遥控器固件");
+
+            // 任何一套套装都不能让小船和遥控器共用同一个镜像文件——那是镜像混用的典型症状。
+            FirmwareSpec boat = ForRole(BoardRole.Boat);
+            FirmwareSpec remote = ForRole(BoardRole.Remote);
+            if (boat != null && remote != null)
+            {
+                if (string.Equals(boat.AppPath, remote.AppPath, StringComparison.OrdinalIgnoreCase))
+                    Problems.Add("小船与遥控器指向同一个应用镜像，镜像混用");
+                if (string.Equals(boat.BootloaderPath, remote.BootloaderPath, StringComparison.OrdinalIgnoreCase) == false)
+                {
+                    // 两端 bootloader 可以不同（分别编译），这里只做记录，不视为错误。
+                }
+            }
         }
 
         public string Summary
         {
             get
             {
+                string speed = TargetRpm > 0 ? "目标 " + TargetRpm + " 转" : "转速未知";
+                string overspeed = OverspeedRpm > 0 ? "，超速保护 " + OverspeedRpm + " 转" : "";
                 return "固件包 " + Version + "：中位 " + CenterUs + "us（左右各 " + SteerDeg + "°：" +
                        AngleMin + "～" + AngleMax + "），脉宽 " + PulseMinUs + "～" + PulseMaxUs +
-                       "us，配对协议 v" + PairProtocol;
+                       "us，" + speed + overspeed + "，配对协议 v" + PairProtocol;
             }
         }
     }

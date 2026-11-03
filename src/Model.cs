@@ -97,6 +97,8 @@ namespace BoatTool
         public string FirmwareId = "";
         public string FirmwareVersion = "";
         public string RawLine = "";
+        // 身份行协议版本：JAYv3 → 3、JAYv4 → 4、旧 JAY ROLE= → 0。
+        public int IdentityLineVersion = -1;
         public string Error = "";
 
         public bool HasFirmwareId { get { return !string.IsNullOrEmpty(FirmwareId); } }
@@ -144,9 +146,11 @@ namespace BoatTool
 
     public static class IdentityParser
     {
-        // JAYv3 ROLE=BOAT MAC=.. PEER=.. PAIR=2 STEER=20 FWID=.. VER=..
+        // 新格式身份行：JAYv3 / JAYv4 ROLE=BOAT MAC=.. [PEER=..] [PAIR=2] [STEER=20] [FWID=..] [VER=..]
+        // 版本号只影响前缀文字（固件端可能继续升版），字段语义不变；
+        // 不认识的更高版本仍按同一字段解析，避免把新固件误判为“无身份”。
         private static readonly Regex V3Pattern = new Regex(
-            "JAYv3\\s+ROLE=(BOAT|REMOTE)\\s+MAC=([0-9A-Fa-f:]{17})(?:\\s+PEER=([0-9A-Fa-f:]{17}))?(?:\\s+PAIR=(\\d+))?(?:\\s+STEER=(-?\\d+))?(?:\\s+FWID=(\\S+))?(?:\\s+VER=(\\S+))?",
+            "JAYv(\\d+)\\s+ROLE=(BOAT|REMOTE)\\s+MAC=([0-9A-Fa-f:]{17})(?:\\s+PEER=([0-9A-Fa-f:]{17}))?(?:\\s+PAIR=(\\d+))?(?:\\s+STEER=(-?\\d+))?(?:\\s+FWID=(\\S+))?(?:\\s+VER=(\\S+))?",
             RegexOptions.Compiled);
 
         // 旧格式：JAY ROLE=BOAT MAC=.. PEER=.. VERSION=2 [STEER=20]
@@ -163,13 +167,14 @@ namespace BoatTool
                 BoardIdentity id = new BoardIdentity();
                 id.Responded = true;
                 id.RawLine = line.Trim();
-                id.Role = RoleNames.FromCode(m.Groups[1].Value);
-                id.Mac = MacText.Normalize(m.Groups[2].Value);
-                if (m.Groups[3].Success) id.Peer = MacText.NormalizePeer(m.Groups[3].Value);
-                if (m.Groups[4].Success) id.PairProtocol = ParseInt(m.Groups[4].Value);
-                if (m.Groups[5].Success) id.SteeringAngle = ParseInt(m.Groups[5].Value);
-                if (m.Groups[6].Success) id.FirmwareId = m.Groups[6].Value;
-                if (m.Groups[7].Success) id.FirmwareVersion = m.Groups[7].Value;
+                id.Role = RoleNames.FromCode(m.Groups[2].Value);
+                id.Mac = MacText.Normalize(m.Groups[3].Value);
+                id.IdentityLineVersion = ParseInt(m.Groups[1].Value);
+                if (m.Groups[4].Success) id.Peer = MacText.NormalizePeer(m.Groups[4].Value);
+                if (m.Groups[5].Success) id.PairProtocol = ParseInt(m.Groups[5].Value);
+                if (m.Groups[6].Success) id.SteeringAngle = ParseInt(m.Groups[6].Value);
+                if (m.Groups[7].Success) id.FirmwareId = m.Groups[7].Value;
+                if (m.Groups[8].Success) id.FirmwareVersion = m.Groups[8].Value;
                 return id.Mac.Length == 0 ? null : id;
             }
 
@@ -185,6 +190,7 @@ namespace BoatTool
                 if (m.Groups[4].Success) id.PairProtocol = ParseInt(m.Groups[4].Value);
                 if (m.Groups[5].Success) id.SteeringAngle = ParseInt(m.Groups[5].Value);
                 // 旧格式没有 FWID，FirmwareId 保持为空，表示必须升级。
+                id.IdentityLineVersion = 0;
                 return id.Mac.Length == 0 ? null : id;
             }
             return null;
@@ -346,10 +352,13 @@ namespace BoatTool
     public class AppPaths
     {
         public string AppRoot;
+        // 单套装兼容字段：指向 AppRoot\固件，用于旧结构与单套装自检。
         public string FirmwareDir;
         public string ToolDir;
         public string ManifestPath;
         public string EsptoolPath;
+        // 多套装：所有导入的发布包都在这个目录下，每个子目录是一套。
+        public string FirmwareLibraryDir;
         public string WritableRoot;
         public string ConfigDir;
         public string RecordsDir;
@@ -360,6 +369,7 @@ namespace BoatTool
         {
             AppPaths paths = new AppPaths();
             paths.AppRoot = AppDomain.CurrentDomain.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar);
+            paths.FirmwareLibraryDir = Path.Combine(paths.AppRoot, "固件库");
             paths.FirmwareDir = Path.Combine(paths.AppRoot, "固件");
             paths.ToolDir = Path.Combine(paths.AppRoot, "工具");
             paths.ManifestPath = Path.Combine(paths.FirmwareDir, "固件清单.json");

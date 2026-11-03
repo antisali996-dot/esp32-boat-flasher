@@ -91,6 +91,17 @@ namespace BoatTool
         public string FirmwareVersion = "";
         public string Fwid = "";
         public bool NoIdentityResponse;
+
+        // 套装相关
+        public FirmwareSuite Suite;
+        public string BoardFwid = "";
+        public string BoardSpeedText = "未知";
+        public string BoardSteerText = "未知";
+        public bool ChangingSuite;         // 板上固件与所选套装不是同一套
+        public bool Downgrade;             // 目标转速低于板上
+        public string CrossSuiteWarning = "";
+        public string NvsNote = "";
+        public bool ExplicitReflash;       // 用户明确选择重刷
     }
 
     public class BackupPlan
@@ -106,30 +117,49 @@ namespace BoatTool
         public string RemotePort = "";
         public BoardIdentity Boat;
         public BoardIdentity Remote;
+        public bool SkipBoat;
+        public bool SkipRemote;
+        public string Description = "";
     }
 
     public class Workflow
     {
         private readonly AppPaths paths;
-        private readonly FirmwareCatalog catalog;
+        private readonly FirmwareLibrary library;
         private readonly RoleStore roles;
         private readonly IBoardTransport transport;
         private readonly IClock clock;
         private readonly IUserInteraction ui;
         private bool safetyAcknowledged;
+        private FirmwareSuite selectedSuite;
+        private bool allowDowngrade;
 
-        public Workflow(AppPaths paths, FirmwareCatalog catalog, RoleStore roles,
+        public Workflow(AppPaths paths, FirmwareLibrary library, RoleStore roles,
                         IBoardTransport transport, IClock clock, IUserInteraction ui)
         {
             this.paths = paths;
-            this.catalog = catalog;
+            this.library = library;
             this.roles = roles;
             this.transport = transport;
             this.clock = clock;
             this.ui = ui;
+            this.selectedSuite = library == null ? null : library.Suites.Find(s => s.Usable);
         }
 
         public bool SafetyAcknowledged { get { return safetyAcknowledged; } set { safetyAcknowledged = value; } }
+
+        // 当前选中的固件套装；为空表示没有可用套装，所有写入操作都必须拒绝。
+        public FirmwareSuite SelectedSuite
+        {
+            get { return selectedSuite; }
+            set { selectedSuite = value; }
+        }
+
+        public FirmwareLibrary Library { get { return library; } }
+
+        // 用户是否已对“降到更低目标转速”做过一次明确确认。
+        // 每次烧录都会重新确认，不会记住上一次；这个开关只用于界面说明。
+        public bool AllowDowngrade { get { return allowDowngrade; } set { allowDowngrade = value; } }
 
         private bool AcknowledgeSafety()
         {
@@ -138,6 +168,19 @@ namespace BoatTool
                 return false;
             safetyAcknowledged = true;
             return true;
+        }
+
+        // 读取芯片需要 esptool：优先用所选套装的；没有就退到固件库里第一个带组件的套装，
+        // 再没有就交给 HardwareTransport 自己的默认路径（失败时给出明确错误）。
+        private string EsptoolOf(FirmwareSuite suite)
+        {
+            if (suite != null && !string.IsNullOrEmpty(suite.EsptoolPath)) return suite.EsptoolPath;
+            if (library != null)
+            {
+                foreach (FirmwareSuite candidate in library.Suites)
+                    if (!string.IsNullOrEmpty(candidate.EsptoolPath)) return candidate.EsptoolPath;
+            }
+            return "";
         }
 
         // 扫描串口即会访问串口（可能复位板子），所以必须先通过一次性安全提示。
@@ -167,9 +210,7 @@ namespace BoatTool
                     {
                         scan.Note = "首次见到的板子，请选择用途";
                     }
-                    FirmwareSpec spec = catalog.ForRole(scan.DisplayRole);
-                    FirmwareCheck check = VersionPolicy.Check(probe.Identity, spec);
-                    if (check.State == FirmwareState.UpgradeRequired) scan.Note = "需要升级：" + check.Reason;
+                    scan.Note = AppendSuiteNote(scan, scan.Note);
                 }
                 else
                 {
@@ -183,7 +224,7 @@ namespace BoatTool
                     }
                     // 无身份回应不代表没有板子：尝试只读芯片 MAC，便于用户核对。
                     string chipError;
-                    ChipInfo chip = transport.ReadChip(port.Name, out chipError);
+                    ChipInfo chip = transport.ReadChip(port.Name, EsptoolOf(selectedSuite), out chipError);
                     if (chip != null)
                     {
                         BoardIdentity blind = new BoardIdentity();
@@ -194,7 +235,7 @@ namespace BoatTool
                         KnownBoard known = roles.Find(chip.Mac);
                         if (known != null) scan.RememberedRole = known.Role;
                         scan.ProbeError = probe.Error;
-                        scan.Note = "程序未回应身份（旧版或空白板）；已读到芯片 MAC。升级会写入本包固件。";
+                        scan.Note = "程序未回应身份（旧版或空白板）；已读到芯片 MAC。";
                     }
                     else
                     {
@@ -207,9 +248,44 @@ namespace BoatTool
             return results;
         }
 
+        // 用所选套装给这块板补一句说明：是否已匹配、是否属于另一套。
+        private string AppendSuiteNote(PortScan scan, string note)
+        {
+            if (!scan.Responded || scan.Identity.Role == BoardRole.Unknown) return note;
+            FirmwareSpec spec = selectedSuite == null ? null : selectedSuite.SpecFor(scan.Identity.Role);
+            if (spec == null) return note;
+            if (string.Equals(scan.Identity.FirmwareId, spec.Fwid, StringComparison.Ordinal))
+                return "与所选套装一致，无需重复烧录";
+
+            List<FirmwareSuite> owners = library == null
+                ? new List<FirmwareSuite>()
+                : library.AllWithFwid(scan.Identity.Role, scan.Identity.FirmwareId);
+            if (owners.Count > 0)
+            {
+                string names = "";
+                foreach (FirmwareSuite owner in owners)
+                {
+                    if (names.Length > 0) names += "、";
+                    names += owner.DisplayName;
+                }
+                string speed = FwidSpeed(scan.Identity.FirmwareId);
+                return "板上是 " + names + (string.IsNullOrEmpty(speed) ? "" : "（" + speed + "）") +
+                       "，与所选套装不同；烧录前会再次确认";
+            }
+            if (!scan.Identity.HasFirmwareId) return "板上无固件身份（旧版），需要升级";
+            return note;
+        }
+
+        private static string FwidSpeed(string fwid)
+        {
+            FwidInfo info = FwidInfo.Parse(fwid);
+            return info.TargetRpm > 0 ? info.TargetRpm + " 转" : "";
+        }
+
         public FirmwareCheck CheckFirmware(PortScan scan, BoardRole role)
         {
-            return VersionPolicy.Check(scan == null ? null : scan.Identity, catalog.ForRole(role));
+            FirmwareSpec spec = selectedSuite == null ? null : selectedSuite.SpecFor(role);
+            return VersionPolicy.Check(scan == null ? null : scan.Identity, spec);
         }
 
         // 只按驱动描述排除明显非 ESP32 的串口；绝不按串口号或名字推断板子角色。
@@ -227,26 +303,29 @@ namespace BoatTool
             return text.Length > 40 ? text.Substring(0, 40) + "…" : text;
         }
 
-        public FirmwareCatalog Catalog { get { return catalog; } }
-
-        public FirmwareSpec SpecFor(BoardRole role) { return catalog.ForRole(role); }
-
-        // 用户拒绝一次性安全提示时为 false，界面据此提示“未读取串口”。
         public bool LastScanCancelled { get { return !safetyAcknowledged; } }
 
         // 烧录当前板：默认不备份；备份是可选项；写入后强制校验并读回身份。
-        public OperationResult FlashCurrent(PortScan scan, BoardRole chosenRole, bool doBackup)
+        // forceReflash 只表示"用户在套装已匹配时仍要求重刷"，不绕过任何安全校验。
+        public OperationResult FlashCurrent(PortScan scan, BoardRole chosenRole, bool doBackup, bool forceReflash)
         {
             OperationResult result = new OperationResult();
-            if (scan == null || scan.Port == null) { result.Error = "没有选择串口"; return result; }
-            if (!AcknowledgeSafety()) { result.Error = "已取消：尚未断开动力电池"; return result; }
-            if (catalog.Problems.Count > 0)
+            FirmwareSuite suite = selectedSuite;
+            if (suite == null)
             {
-                result.Error = "固件包自检未通过：" + string.Join("；", catalog.Problems.ToArray());
+                result.Error = "还没有选择可用的固件套装。请先在界面上选择要写入的套装。";
                 return result;
             }
+            if (!suite.Usable)
+            {
+                result.Error = "所选固件套装自检未通过：" + string.Join("；", suite.Problems.ToArray());
+                return result;
+            }
+            if (scan == null || scan.Port == null) { result.Error = "没有选择串口"; return result; }
+            if (!AcknowledgeSafety()) { result.Error = "已取消：尚未断开动力电池"; return result; }
 
             string port = scan.Port.Name;
+            string esptool = suite.EsptoolPath;
             ProbeResult probe = transport.Probe(port, 5000);
             BoardIdentity identity;
             if (probe.Ok)
@@ -255,9 +334,9 @@ namespace BoatTool
             }
             else
             {
-                // 老固件（15~30°）、空白板或非本项目程序不会回应 JAY INFO；
+                // 老固件、空白板或非本项目程序不会回应 JAY INFO；
                 // 这种板子只能靠芯片 MAC 识别，且必须由用户明确指定用途并确认。
-                identity = IdentityFromChip(port, result);
+                identity = IdentityFromChip(port, esptool, result);
                 if (identity == null) return result;
                 result.Step("板子没有回应身份查询，按芯片 MAC 识别：" + identity.Mac + "（旧程序或空白板）");
             }
@@ -278,13 +357,28 @@ namespace BoatTool
                 return result;
             }
 
-            FirmwareSpec spec = catalog.ForRole(role);
+            FirmwareSpec spec = suite.SpecFor(role);
+            if (spec == null)
+            {
+                result.Error = "所选套装缺少" + RoleNames.Chinese(role) + "固件，已停止。";
+                return result;
+            }
+            PartitionLayout layout = suite.LayoutFor(role);
+            if (layout == null || !layout.Parsed || !string.IsNullOrEmpty(layout.Error))
+            {
+                result.Error = "所选套装的分区布局与本工具不兼容，已拒绝写入：" +
+                               (layout == null ? "未解析分区表" : layout.Error) +
+                               "。为避免覆盖配对区或越界写入，本次没有写入任何内容。";
+                return result;
+            }
+
             FirmwareCheck check = VersionPolicy.Check(identity, spec);
-            if (check.State == FirmwareState.Current)
+            if (check.State == FirmwareState.Current && !forceReflash)
             {
                 result.Ok = true;
-                result.Summary = "这块板已经是本包最新固件（" + catalog.Version + "，" + identity.SteeringText +
-                                 "），无需烧录。需要配对请使用“配对两块板”。";
+                result.Summary = "这块板已经与所选套装【" + suite.DisplayName + "】完全一致（" + identity.SteeringText +
+                                 "，FWID " + identity.FirmwareId + "），无需重复烧录。";
+                result.Summary += Environment.NewLine + "如果确实要重刷，请勾选“即使已匹配也重刷”后再点“烧录当前板”。";
                 result.Step("固件身份一致：" + identity.FirmwareId);
                 roles.Remember(identity.Mac, role, port, "已是最新，未重写");
                 return result;
@@ -301,9 +395,41 @@ namespace BoatTool
             plan.Role = role;
             plan.Check = check;
             plan.DoBackup = doBackup;
-            plan.FirmwareVersion = catalog.Version;
+            plan.FirmwareVersion = suite.Version;
             plan.Fwid = spec.Fwid;
             plan.NoIdentityResponse = !identity.Responded;
+            plan.Suite = suite;
+            plan.BoardFwid = identity.HasFirmwareId ? identity.FirmwareId : "";
+            FwidInfo boardInfo = FwidInfo.Parse(identity.FirmwareId);
+            plan.BoardSpeedText = boardInfo.TargetRpm > 0 ? boardInfo.TargetRpm + " 转" : (identity.HasFirmwareId ? "未知" : "旧版无身份");
+            plan.BoardSteerText = identity.SteeringAngle >= 0 ? "左右各 " + identity.SteeringAngle + "°" : "未知";
+            plan.ExplicitReflash = forceReflash;
+
+            FirmwareSuite boardSuite = library == null ? null : library.FindByFwid(role, identity.FirmwareId);
+            plan.ChangingSuite = IsDifferentSuite(boardSuite, suite) ||
+                                  !string.Equals(identity.FirmwareId, spec.Fwid, StringComparison.Ordinal);
+            if (boardSuite != null && !string.Equals(boardSuite.Id, suite.Id, StringComparison.OrdinalIgnoreCase))
+            {
+                plan.CrossSuiteWarning = "这块板现在运行【" + boardSuite.DisplayName + "】（" + boardSuite.Version +
+                                         "），将切换为【" + suite.DisplayName + "】（" + suite.Version + "）。";
+            }
+            else if (boardSuite == null && !string.Equals(identity.FirmwareId, spec.Fwid, StringComparison.Ordinal))
+            {
+                plan.CrossSuiteWarning = "这块板的固件不在本工具固件库中（FWID " +
+                                         (string.IsNullOrEmpty(identity.FirmwareId) ? "无" : identity.FirmwareId) +
+                                         "），将改写为【" + suite.DisplayName + "】。";
+            }
+
+            // 降级 = 目标转速低于板上既有目标转速。必须单独确认，不能静默执行。
+            if (boardInfo.TargetRpm > 0 && suite.TargetRpm > 0 && suite.TargetRpm < boardInfo.TargetRpm)
+            {
+                plan.Downgrade = true;
+                plan.CrossSuiteWarning += Environment.NewLine +
+                    "注意：这是降级——板上目标 " + boardInfo.TargetRpm + " 转，将写入 " + suite.TargetRpm + " 转。";
+            }
+
+            plan.NvsNote = "写入 " + spec.DescribeImages() + "；分区表校验通过：" + layout.DescribeNvs();
+
             if (!ui.ConfirmFlash(plan))
             {
                 result.Error = "已取消，没有备份或写入";
@@ -312,16 +438,18 @@ namespace BoatTool
 
             result.RecordDir = paths.NewSession("烧录-" + RoleNames.Chinese(role));
             Logger log = new Logger(Path.Combine(result.RecordDir, "操作记录.txt"), ui.Report);
+            log.Info("套装：" + suite.DisplayName + "（" + suite.Id + "，版本 " + suite.Version + "）");
             log.Info("目标：串口 " + port + "，MAC " + identity.Mac + "，角色 " + RoleNames.Chinese(role));
             log.Info("板上固件：" + identity.FirmwareText + "（" + (identity.HasFirmwareId ? identity.FirmwareId : "无 FWID") + "）");
             log.Info("目标固件：" + spec.Version + "（" + spec.Fwid + "）");
+            log.Info("分区布局：" + layout.DescribeNvs());
 
             string chipMac = "";
             long backupBytes = -1;
             if (doBackup)
             {
                 string chipError;
-                ChipInfo chip = transport.ReadChip(port, out chipError);
+                ChipInfo chip = transport.ReadChip(port, esptool, out chipError);
                 if (chip == null)
                 {
                     result.Error = "备份前读取芯片信息失败：" + chipError + "。已停止，尚未写入固件。";
@@ -339,7 +467,7 @@ namespace BoatTool
                     return result;
                 }
                 chipMac = chip.Mac;
-                if (!BackupInternal(port, chip, result.RecordDir, log, result, out backupBytes))
+                if (!BackupInternal(port, esptool, chip, result.RecordDir, log, result, out backupBytes))
                 {
                     result.Error = "备份未完成，已停止，尚未写入固件。";
                     return result;
@@ -353,7 +481,7 @@ namespace BoatTool
             // 写入前再核对一次：芯片 MAC 必须与确认时一致（防换插）；
             // 若板子能回应身份，角色也必须一致。旧板不回应身份时只按芯片 MAC 判断。
             string recheckError;
-            ChipInfo recheck = transport.ReadChip(port, out recheckError);
+            ChipInfo recheck = transport.ReadChip(port, esptool, out recheckError);
             if (recheck == null)
             {
                 result.Error = "写入前复核芯片失败：" + recheckError + "，已停止，没有写入。";
@@ -395,8 +523,8 @@ namespace BoatTool
             }
             result.Step("写入前复核通过：芯片 MAC " + recheck.Mac + "（" + RoleNames.Chinese(role) + "）");
 
-            log.Info("开始写入并校验");
-            FlashResult flash = transport.WriteFirmware(port, spec, true, result.RecordDir, log);
+            log.Info("开始写入并校验：" + spec.DescribeImages());
+            FlashResult flash = transport.WriteFirmware(port, esptool, spec, true, result.RecordDir, log);
             if (!flash.Ok)
             {
                 result.Error = flash.Error + "。写入失败，不能视为烧录成功。";
@@ -426,20 +554,28 @@ namespace BoatTool
             FirmwareCheck afterCheck = VersionPolicy.Check(after, spec);
             if (afterCheck.State != FirmwareState.Current)
             {
-                result.Error = "写入后读回的固件身份不符合本包（" + afterCheck.Reason + "），不能视为成功。";
+                result.Error = "写入后读回的固件身份不符合本套装（" + afterCheck.Reason + "），不能视为成功。";
                 return result;
             }
             result.Step("重启后身份核对通过：" + after.Mac + " / " + RoleNames.Chinese(role) + " / " + after.FirmwareText +
                         " / " + after.SteeringText);
-            roles.Remember(after.Mac, role, port, "烧录 " + spec.Version);
+            roles.Remember(after.Mac, role, port, "烧录 " + suite.Id);
             log.Info("烧录完成并通过写入校验与重启读回核对");
             result.Ok = true;
             result.Summary = "烧录完成：串口 " + port + "，MAC " + after.Mac + "，角色 " + RoleNames.Chinese(role) +
-                             "，固件 " + spec.Version + "（" + after.SteeringText + "）。写入校验与重启读回均已通过。";
+                             "，套装【" + suite.DisplayName + "】，固件 " + spec.Version + "（" + after.SteeringText + "）。" +
+                             "写入校验与重启读回均已通过。";
+            result.Summary += Environment.NewLine + "保留 NVS 配对区：" + layout.DescribeNvs();
             result.Summary += Environment.NewLine + "记录目录：" + result.RecordDir;
             if (!doBackup)
                 result.Summary += Environment.NewLine + "本次未备份原固件（按默认设置）。需要时可用“备份原固件”。";
             return result;
+        }
+
+        // 只有“确实换了一套不同的固件”才提示跨套装；同一套里重刷不算。
+        private static bool IsDifferentSuite(FirmwareSuite boardSuite, FirmwareSuite target)
+        {
+            return boardSuite != null && !string.Equals(boardSuite.Id, target.Id, StringComparison.OrdinalIgnoreCase);
         }
 
         private BoardRole ResolveRoleForFlash(BoardIdentity identity, BoardRole chosenRole, OperationResult result)
@@ -464,10 +600,10 @@ namespace BoatTool
         }
 
         // 旧程序/空白板不回应 JAY INFO 时，只能按芯片 MAC 识别；用途仍需用户选择。
-        private BoardIdentity IdentityFromChip(string port, OperationResult result)
+        private BoardIdentity IdentityFromChip(string port, string esptool, OperationResult result)
         {
             string error;
-            ChipInfo chip = transport.ReadChip(port, out error);
+            ChipInfo chip = transport.ReadChip(port, esptool, out error);
             if (chip == null)
             {
                 result.Error = "板子没有回应身份查询，读取芯片也失败：" + error +
@@ -489,6 +625,7 @@ namespace BoatTool
             if (!AcknowledgeSafety()) { result.Error = "已取消：尚未断开动力电池"; return result; }
 
             string port = scan.Port.Name;
+            string esptool = EsptoolOf(selectedSuite);
             ProbeResult probe = transport.Probe(port, 5000);
             BoardIdentity identity;
             if (probe.Ok)
@@ -498,13 +635,13 @@ namespace BoatTool
             else
             {
                 // 旧板不回应身份也可以备份：备份是只读操作，按芯片 MAC 记录即可。
-                identity = IdentityFromChip(port, result);
+                identity = IdentityFromChip(port, esptool, result);
                 if (identity == null) return result;
                 result.Step("板子没有回应身份查询，按芯片 MAC 备份：" + identity.Mac);
             }
 
             string chipError;
-            ChipInfo chip = transport.ReadChip(port, out chipError);
+            ChipInfo chip = transport.ReadChip(port, esptool, out chipError);
             if (chip == null) { result.Error = chipError; return result; }
             if (probe.Ok && chip.Mac != identity.Mac)
             {
@@ -527,7 +664,7 @@ namespace BoatTool
             result.RecordDir = paths.NewSession("备份-" + (identity.Role == BoardRole.Unknown ? "未登记" : RoleNames.Chinese(identity.Role)));
             Logger log = new Logger(Path.Combine(result.RecordDir, "操作记录.txt"), ui.Report);
             long bytes;
-            if (!BackupInternal(port, chip, result.RecordDir, log, result, out bytes))
+            if (!BackupInternal(port, esptool, chip, result.RecordDir, log, result, out bytes))
             {
                 result.Error = "备份失败：" + (result.Error.Length > 0 ? result.Error : "未知原因");
                 return result;
@@ -540,13 +677,13 @@ namespace BoatTool
         }
 
         // 仅读取，不写入不擦除；调用方已核对过芯片 MAC。
-        private bool BackupInternal(string port, ChipInfo chip, string recordDir, Logger log,
+        private bool BackupInternal(string port, string esptool, ChipInfo chip, string recordDir, Logger log,
                                     OperationResult result, out long flashBytes)
         {
             flashBytes = chip.FlashBytes;
             log.Info("芯片 MAC " + chip.Mac + "，Flash " + (chip.FlashBytes / 1024 / 1024) + "MB，开始读取整片备份");
             string dest = Path.Combine(recordDir, "原固件.bin");
-            BackflashResult backup = transport.ReadFlash(port, dest, chip.FlashBytes, log);
+            BackflashResult backup = transport.ReadFlash(port, esptool, dest, chip.FlashBytes, log);
             if (!backup.Ok)
             {
                 result.Error = backup.Error;
@@ -564,7 +701,8 @@ namespace BoatTool
             return true;
         }
 
-        // 两块板同时连接：分别核对芯片身份，一次完成双方配对、重启与读回核验。
+        // 两块板同时连接：分别核对芯片身份，只改对端地址，一次完成双方配对与读回核验。
+        // 已指向正确对端的一端跳过写入与重启；重试时只处理尚未完成的一端。
         public OperationResult PairTwoBoards(PortScan boatScan, PortScan remoteScan)
         {
             OperationResult result = new OperationResult();
@@ -581,12 +719,8 @@ namespace BoatTool
                 return result;
             }
             if (!AcknowledgeSafety()) { result.Error = "已取消：尚未断开动力电池"; return result; }
-            if (catalog.Problems.Count > 0)
-            {
-                result.Error = "固件包自检未通过：" + string.Join("；", catalog.Problems.ToArray());
-                return result;
-            }
 
+            string esptool = EsptoolOf(selectedSuite);
             ProbeResult boatProbe = transport.Probe(boatPort, 5000);
             if (!boatProbe.Ok) { result.Error = "读取小船（" + boatPort + "）身份失败：" + boatProbe.Error; return result; }
             ProbeResult remoteProbe = transport.Probe(remotePort, 5000);
@@ -623,25 +757,27 @@ namespace BoatTool
                 return result;
             }
 
-            FirmwareCheck boatCheck = VersionPolicy.Check(boat, catalog.ForRole(BoardRole.Boat));
-            FirmwareCheck remoteCheck = VersionPolicy.Check(remote, catalog.ForRole(BoardRole.Remote));
-            if (boatCheck.State != FirmwareState.Current || remoteCheck.State != FirmwareState.Current)
+            // 配对只检查“能否互相对上”：配对协议版本相同、转向契约相同、双方都是本项目固件。
+            // 目标转速/套装版本不同不算不兼容——590 小船配同一 20° 遥控器是允许的组合。
+            string compat;
+            if (!PairCompatibility.Check(boat, remote, out compat))
             {
-                result.Error = "配对前发现固件不是本包版本，需要先升级：\n" +
-                               (boatCheck.State != FirmwareState.Current ? "小船：" + boatCheck.Reason + "\n" : "") +
-                               (remoteCheck.State != FirmwareState.Current ? "遥控器：" + remoteCheck.Reason + "\n" : "") +
-                               "请分别使用“烧录当前板”升级，再回来配对。配对只改地址，不会顺带升级固件。";
+                result.Error = "两块板不能直接配对：" + compat;
                 return result;
             }
+
+            bool boatAlready = boat.Peer == remote.Mac;
+            bool remoteAlready = remote.Peer == boat.Mac;
 
             PairPlan plan = new PairPlan();
             plan.BoatPort = boatPort;
             plan.RemotePort = remotePort;
             plan.Boat = boat;
             plan.Remote = remote;
-            // 两端都已指向对方时不再重复写入，但仍要明确告知结果。
-            bool boatAlready = boat.Peer == remote.Mac;
-            bool remoteAlready = remote.Peer == boat.Mac;
+            plan.SkipBoat = boatAlready;
+            plan.SkipRemote = remoteAlready;
+            plan.Description = compat;
+
             if (boatAlready && remoteAlready)
             {
                 roles.Remember(boat.Mac, BoardRole.Boat, boatPort, "配对已一致");
@@ -656,9 +792,12 @@ namespace BoatTool
 
             result.RecordDir = paths.NewSession("配对");
             Logger log = new Logger(Path.Combine(result.RecordDir, "操作记录.txt"), ui.Report);
-            log.Info("小船：" + boatPort + " / " + boat.Mac + "：" + boat.PeerText);
-            log.Info("遥控器：" + remotePort + " / " + remote.Mac + "：" + remote.PeerText);
+            log.Info("小船：" + boatPort + " / " + boat.Mac + "：" + boat.PeerText +
+                     (boatAlready ? "（已正确，跳过）" : ""));
+            log.Info("遥控器：" + remotePort + " / " + remote.Mac + "：" + remote.PeerText +
+                     (remoteAlready ? "（已正确，跳过）" : ""));
             log.Info("将把小船对端设为 " + remote.Mac + "，遥控器对端设为 " + boat.Mac);
+            log.Info("兼容性：" + compat);
 
             // 写入前再次核对两端身份（换插防护）。
             ProbeResult reBoat = transport.Probe(boatPort, 5000);
@@ -671,39 +810,73 @@ namespace BoatTool
                 return result;
             }
 
-            int completed = 0;
-            PairWriteResult boatWrite = transport.WritePair(boatPort, remote.Mac, boat, log);
-            if (boatWrite.Ok)
+            int needed = (boatAlready ? 0 : 1) + (remoteAlready ? 0 : 1);
+            int done = 0;
+            bool boatDone = boatAlready;
+            bool remoteDone = remoteAlready;
+            string boatError = "";
+            string remoteError = "";
+
+            if (!boatAlready)
             {
-                completed++;
-                result.Step("小船：已保存并重启读回，对端 " + remote.Mac + "（本机 " + boat.Mac + "）");
-                roles.Remember(boat.Mac, BoardRole.Boat, boatPort, "配对 " + remote.Mac);
-                log.Info("小船配对完成并通过读回核验");
+                PairWriteResult boatWrite = transport.WritePair(boatPort, remote.Mac, boat, log);
+                if (boatWrite.Ok)
+                {
+                    done++;
+                    boatDone = true;
+                    result.Step("小船：已保存并重启读回，对端 " + remote.Mac + "（本机 " + boat.Mac + "）");
+                    roles.Remember(boat.Mac, BoardRole.Boat, boatPort, "配对 " + remote.Mac);
+                    log.Info("小船配对完成并通过读回核验");
+                }
+                else
+                {
+                    boatError = boatWrite.Error;
+                    log.Info("小船配对失败：" + boatError);
+                }
             }
             else
             {
-                result.Error = "小船配对失败：" + boatWrite.Error;
-                log.Info(result.Error);
-                result.Summary = "未完成：小船这一步就失败了（已完成 " + completed + "/2）。遥控器没有改动。\n" + result.Error;
-                return result;
+                result.Step("小船：对端已经是 " + remote.Mac + "，跳过写入与重启");
             }
 
-            PairWriteResult remoteWrite = transport.WritePair(remotePort, boat.Mac, remote, log);
-            if (remoteWrite.Ok)
+            if (!remoteAlready)
             {
-                completed++;
-                result.Step("遥控器：已保存并重启读回，对端 " + boat.Mac + "（本机 " + remote.Mac + "）");
-                roles.Remember(remote.Mac, BoardRole.Remote, remotePort, "配对 " + boat.Mac);
-                log.Info("遥控器配对完成并通过读回核验");
+                PairWriteResult remoteWrite = transport.WritePair(remotePort, boat.Mac, remote, log);
+                if (remoteWrite.Ok)
+                {
+                    done++;
+                    remoteDone = true;
+                    result.Step("遥控器：已保存并重启读回，对端 " + boat.Mac + "（本机 " + remote.Mac + "）");
+                    roles.Remember(remote.Mac, BoardRole.Remote, remotePort, "配对 " + boat.Mac);
+                    log.Info("遥控器配对完成并通过读回核验");
+                }
+                else
+                {
+                    remoteError = remoteWrite.Error;
+                    log.Info("遥控器配对失败：" + remoteError);
+                }
             }
             else
             {
+                result.Step("遥控器：对端已经是 " + boat.Mac + "，跳过写入与重启");
+            }
+
+            if (!boatDone || !remoteDone)
+            {
+                string pending = "";
+                if (!boatDone) pending += "小船";
+                if (!remoteDone) pending += (pending.Length > 0 ? "、" : "") + "遥控器";
+                string detail = "";
+                if (!boatDone && boatError.Length > 0) detail += "小船失败原因：" + boatError + "\n";
+                if (!remoteDone && remoteError.Length > 0) detail += "遥控器失败原因：" + remoteError + "\n";
                 result.Partial = true;
-                result.Error = "遥控器配对失败：" + remoteWrite.Error;
-                log.Info(result.Error);
-                result.Summary = "部分完成（1/2）：小船已保存并读回校验通过（对端 " + remote.Mac +
-                                 "）；遥控器这一步失败：" + remoteWrite.Error +
-                                 "\n两端现在可能暂时无法通信。排除连接问题后，重新点击“配对两块板”即可重试；重试会重新写入两边。";
+                result.Error = "尚未完成：还需处理" + pending;
+                string progress = "已完成 " + done + "/" + needed;
+                if (boatAlready) progress += "，小船本来已正确";
+                if (remoteAlready) progress += "，遥控器本来已正确";
+                result.Summary = "部分完成（" + progress + "）：" + detail;
+                result.Summary += "两端现在可能暂时无法通信。排除连接问题后，再次点击“配对两块板”即可重试；" +
+                                  "重试只会处理尚未完成的一端，已正确的一端不会重写。";
                 return result;
             }
 
@@ -714,7 +887,7 @@ namespace BoatTool
             {
                 result.Partial = true;
                 result.Error = "两端写入均已完成，但最终复核时有板子没有回应。";
-                result.Summary = "部分完成：两边都已保存并读回，但最终复核失败（" +
+                result.Summary = "部分完成：本次需要改的一端都已保存并读回，但最终复核失败（" +
                                  (finalBoat.Ok ? "" : "小船无回应；") + (finalRemote.Ok ? "" : "遥控器无回应；") +
                                  "）。请重新连接后点“刷新列表”核对，再视情况重试。";
                 return result;
@@ -730,9 +903,13 @@ namespace BoatTool
             }
 
             result.Ok = true;
-            result.Summary = "配对完成：两端的配对地址、重启和读回核验均已通过。";
+            result.Summary = "配对完成：两端对端地址一致，重启与读回核验均已通过。";
             result.Summary += Environment.NewLine + "小船 " + boat.Mac + " ←→ 遥控器 " + remote.Mac;
-            result.Summary += Environment.NewLine + "只修改了持久配对地址，没有重新烧录固件。MAC 过滤不是加密认证，不能抵御刻意伪造 MAC。";
+            if (boatAlready || remoteAlready)
+                result.Summary += Environment.NewLine + "本次跳过已正确的一端，只写了需要改的一端。";
+            result.Summary += Environment.NewLine + "只修改了保存的对端地址，没有切换固件套装、没有重刷程序。";
+            result.Summary += Environment.NewLine + "兼容性：" + compat;
+            result.Summary += Environment.NewLine + "MAC 过滤不是加密认证，不能抵御刻意伪造 MAC。";
             result.Summary += Environment.NewLine + "记录目录：" + result.RecordDir;
             return result;
         }
@@ -751,6 +928,71 @@ namespace BoatTool
                                expected.Mac + "/" + expected.RoleText + "。已停止，没有修改任何配对。";
                 return false;
             }
+            return true;
+        }
+    }
+
+    // 配对兼容性：只看两端能否在协议层对上，不看目标转速或套装版本。
+    public static class PairCompatibility
+    {
+        public static bool Check(BoardIdentity boat, BoardIdentity remote, out string description)
+        {
+            description = "";
+            if (boat == null || remote == null)
+            {
+                description = "缺少任一端身份";
+                return false;
+            }
+            if (!boat.Responded || !remote.Responded)
+            {
+                description = "至少一端程序过旧，未回应身份查询；请先升级到本工具支持的固件再配对";
+                return false;
+            }
+            if (!boat.HasFirmwareId || !remote.HasFirmwareId)
+            {
+                description = "至少一端缺少固件身份（FWID），无法确认协议与转向契约；请先升级";
+                return false;
+            }
+            if (boat.Role != BoardRole.Boat || remote.Role != BoardRole.Remote)
+            {
+                description = "角色不符：需要一块小船和一块遥控器";
+                return false;
+            }
+            if (boat.PairProtocol <= 0 || remote.PairProtocol <= 0)
+            {
+                description = "至少一端没有报告配对协议版本";
+                return false;
+            }
+            if (boat.PairProtocol != remote.PairProtocol)
+            {
+                description = "配对协议版本不同（小船 v" + boat.PairProtocol + "，遥控器 v" + remote.PairProtocol +
+                              "），串口命令不兼容；请统一到同一次发布";
+                return false;
+            }
+            FwidInfo boatInfo = FwidInfo.Parse(boat.FirmwareId);
+            FwidInfo remoteInfo = FwidInfo.Parse(remote.FirmwareId);
+            if (!boatInfo.Parsed || !remoteInfo.Parsed)
+            {
+                description = "无法从 FWID 解析转向契约（小船 " + boat.FirmwareId + "，遥控器 " + remote.FirmwareId + "）";
+                return false;
+            }
+            if (!FwidInfo.SameSteeringContract(boatInfo, remoteInfo))
+            {
+                description = "转向契约不同：小船 " + boatInfo.SteerDeg + "°（" + boatInfo.AngleMin + "～" +
+                              boatInfo.AngleMax + "），遥控器 " + remoteInfo.SteerDeg + "°（" + remoteInfo.AngleMin +
+                              "～" + remoteInfo.AngleMax + "）";
+                return false;
+            }
+            if (remoteInfo.TargetRpm > 0 && boatInfo.TargetRpm > 0 && remoteInfo.TargetRpm != boatInfo.TargetRpm)
+            {
+                // 遥控器的转速字段不参与小船调速，这里只提示不阻止。
+                description = "转向契约一致（" + boatInfo.SteerDeg + "°，" + boatInfo.AngleMin + "～" +
+                              boatInfo.AngleMax + "°）；小船目标 " + boatInfo.TargetRpm + " 转，遥控器固件标称 " +
+                              remoteInfo.TargetRpm + " 转（遥控器不控制油门，可正常配对）";
+                return true;
+            }
+            description = "配对协议 v" + boat.PairProtocol + "，转向契约一致（" + boatInfo.SteerDeg + "°，" +
+                          boatInfo.AngleMin + "～" + boatInfo.AngleMax + "°）";
             return true;
         }
     }

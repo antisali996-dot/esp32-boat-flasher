@@ -46,6 +46,8 @@ namespace BoatTool
         public HashSet<string> SilentPorts = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         // 模拟写入后板子的实际状态（用于验证读回判定）。
         public Action<string, FirmwareSpec, SimBoard> OnWrite;
+        // 记录最近一次实际使用的 esptool 路径，用于验证“用所选套装自己的烧录组件”。
+        public string LastEsptool = "";
 
         public void AddPort(string name)
         {
@@ -108,9 +110,10 @@ namespace BoatTool
             return new ProbeResult { Ok = true, Identity = id };
         }
 
-        public ChipInfo ReadChip(string port, out string error)
+        public ChipInfo ReadChip(string port, string esptoolPath, out string error)
         {
             ReadChipCount++;
+            LastEsptool = esptoolPath;
             SimBoard board = BoardOnPort(port);
             if (board == null) { error = "模拟：该串口没有板子"; return null; }
             error = "";
@@ -123,7 +126,7 @@ namespace BoatTool
             return info;
         }
 
-        public BackflashResult ReadFlash(string port, string destPath, long bytes, Logger log)
+        public BackflashResult ReadFlash(string port, string esptoolPath, string destPath, long bytes, Logger log)
         {
             ReadFlashCount++;
             SimBoard board = BoardOnPort(port);
@@ -148,8 +151,10 @@ namespace BoatTool
             return result;
         }
 
-        public FlashResult WriteFirmware(string port, FirmwareSpec spec, bool verify, string logDir, Logger log)
+        public FlashResult WriteFirmware(string port, string esptoolPath, FirmwareSpec spec, bool verify,
+                                         string logDir, Logger log)
         {
+            LastEsptool = esptoolPath;
             WriteFirmwareCount++;
             SimBoard board = BoardOnPort(port);
             FlashResult result = new FlashResult();

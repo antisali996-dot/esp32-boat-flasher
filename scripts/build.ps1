@@ -15,6 +15,8 @@ $shared = @(
     (Join-Path $src 'Model.cs'),
     (Join-Path $src 'Json.cs'),
     (Join-Path $src 'FirmwareCatalog.cs'),
+    (Join-Path $src 'PartitionLayout.cs'),
+    (Join-Path $src 'FirmwareLibrary.cs'),
     (Join-Path $src 'RoleStore.cs'),
     (Join-Path $src 'Transport.cs'),
     (Join-Path $src 'Workflow.cs')

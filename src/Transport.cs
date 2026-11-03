@@ -69,13 +69,14 @@ namespace BoatTool
         // 读取 USB 身份；识别操作可能复位板子。
         ProbeResult Probe(string port, int timeoutMs);
 
-        // 读芯片 MAC 与 Flash 容量；会复位并占用串口。
-        ChipInfo ReadChip(string port, out string error);
+        // 读芯片 MAC 与 Flash 容量；会复位并占用串口。esptoolPath 由所选套装提供。
+        ChipInfo ReadChip(string port, string esptoolPath, out string error);
 
-        BackflashResult ReadFlash(string port, string destPath, long bytes, Logger log);
+        BackflashResult ReadFlash(string port, string esptoolPath, string destPath, long bytes, Logger log);
 
         // verify 始终为 true（保留写入校验）；保留参数以便测试可验证"未校验即失败"的分支。
-        FlashResult WriteFirmware(string port, FirmwareSpec spec, bool verify, string logDir, Logger log);
+        FlashResult WriteFirmware(string port, string esptoolPath, FirmwareSpec spec, bool verify,
+                                  string logDir, Logger log);
 
         PairWriteResult WritePair(string port, string peerMac, BoardIdentity expected, Logger log);
     }

@@ -145,11 +145,12 @@ namespace BoatTool
             }
         }
 
-        public ChipInfo ReadChip(string port, out string error)
+        public ChipInfo ReadChip(string port, string esptoolPath, out string error)
         {
             error = "";
             string output;
-            int code = RunEsptool(new string[] { "--chip", "esp32", "--port", port, "--baud", "115200", "flash_id" },
+            int code = RunEsptool(esptoolPath,
+                new string[] { "--chip", "esp32", "--port", port, "--baud", "115200", "flash_id" },
                 null, out output);
             if (code != 0)
             {
@@ -171,12 +172,12 @@ namespace BoatTool
             return info;
         }
 
-        public BackflashResult ReadFlash(string port, string destPath, long bytes, Logger log)
+        public BackflashResult ReadFlash(string port, string esptoolPath, string destPath, long bytes, Logger log)
         {
             BackflashResult result = new BackflashResult();
             if (bytes <= 0) { result.Error = "未识别到可备份的 Flash 容量"; return result; }
             string output;
-            int code = RunEsptool(new string[]
+            int code = RunEsptool(esptoolPath, new string[]
             {
                 "--chip", "esp32", "--port", port, "--baud", "460800", "read_flash",
                 "0x0", "0x" + bytes.ToString("X", CultureInfo.InvariantCulture), destPath
@@ -200,7 +201,8 @@ namespace BoatTool
             return result;
         }
 
-        public FlashResult WriteFirmware(string port, FirmwareSpec spec, bool verify, string logDir, Logger log)
+        public FlashResult WriteFirmware(string port, string esptoolPath, FirmwareSpec spec, bool verify,
+                                         string logDir, Logger log)
         {
             FlashResult result = new FlashResult();
             List<string> args = new List<string>
@@ -221,7 +223,7 @@ namespace BoatTool
                 return result;
             }
             string output;
-            int code = RunEsptool(args.ToArray(), log, out output);
+            int code = RunEsptool(esptoolPath, args.ToArray(), log, out output);
             result.LogPath = logDir;
             // esptool 在部分错误下仍可能返回 0，必须同时看到校验成功字样。
             bool hashOk = output.IndexOf("Hash of data verified", StringComparison.OrdinalIgnoreCase) >= 0;
@@ -406,12 +408,12 @@ namespace BoatTool
             return "MAC " + id.MacText + " / " + id.RoleText;
         }
 
-        private int RunEsptool(string[] args, Logger log, out string output)
+        private int RunEsptool(string esptoolPath, string[] args, Logger log, out string output)
         {
             List<string> full = new List<string>();
             for (int i = 0; i < args.Length; i++) full.Add(args[i]);
             ProcessStartInfo start = new ProcessStartInfo();
-            start.FileName = paths.EsptoolPath;
+            start.FileName = string.IsNullOrEmpty(esptoolPath) ? paths.EsptoolPath : esptoolPath;
             start.Arguments = JoinArguments(full);
             start.UseShellExecute = false;
             start.RedirectStandardOutput = true;

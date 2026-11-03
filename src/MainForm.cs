@@ -10,12 +10,15 @@ namespace BoatTool
     public class MainForm : Form, IUserInteraction
     {
         private readonly AppPaths paths;
-        private readonly FirmwareCatalog catalog;
+        private readonly FirmwareLibrary library;
         private readonly RoleStore roles;
         private readonly IBoardTransport transport;
         private readonly Workflow workflow;
 
         private readonly ListView portList = new ListView();
+        private readonly ComboBox suiteChoice = new ComboBox();
+        private readonly Label suiteInfo = new Label();
+        private readonly CheckBox forceReflashCheck = new CheckBox();
         private readonly ComboBox roleChoice = new ComboBox();
         private readonly ComboBox boatPortChoice = new ComboBox();
         private readonly ComboBox remotePortChoice = new ComboBox();
@@ -27,26 +30,28 @@ namespace BoatTool
         private readonly RichTextBox logBox = new RichTextBox();
         private readonly Label statusLabel = new Label();
         private readonly Label catalogLabel = new Label();
-        private readonly TabControl tabs = new TabControl();
         private readonly Dictionary<string, PortScan> scans = new Dictionary<string, PortScan>(StringComparer.OrdinalIgnoreCase);
         private bool busy;
 
-        public MainForm(AppPaths paths, FirmwareCatalog catalog, RoleStore roles, IBoardTransport transport)
+        public MainForm(AppPaths paths, FirmwareLibrary library, RoleStore roles, IBoardTransport transport)
         {
             this.paths = paths;
-            this.catalog = catalog;
+            this.library = library;
             this.roles = roles;
             this.transport = transport;
-            this.workflow = new Workflow(paths, catalog, roles, transport, new SystemClock(), this);
+            this.workflow = new Workflow(paths, library, roles, transport, new SystemClock(), this);
 
             BuildUi();
-            AppendLog("工具已就绪。固件包：" + catalog.Version);
-            AppendLog(catalog.Summary);
-            if (catalog.Problems.Count > 0)
+            FillSuites();
+            AppendLog("工具已就绪。固件库：" + library.Root);
+            foreach (FirmwareSuite suite in library.Suites)
             {
-                foreach (string problem in catalog.Problems) AppendLog("固件包自检问题：" + problem);
-                SetStatus("固件包自检未通过，烧录与配对已禁用", true);
+                if (suite.Usable) AppendLog("可用套装：" + suite.Display + "；" + suite.Catalog.Summary);
+                else AppendLog("套装不可用：" + suite.Id + " —— " + string.Join("；", suite.Problems.ToArray()));
             }
+            foreach (string problem in library.Problems) AppendLog("固件库问题：" + problem);
+            if (library.Suites.Count == 0 || currentSuite() == null)
+                SetStatus("没有可用的固件套装，烧录与配对已禁用", true);
             if (!string.IsNullOrEmpty(roles.LoadError)) AppendLog(roles.LoadError);
             if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("BOATTOOL_NO_AUTOSCAN")))
             {
@@ -60,26 +65,29 @@ namespace BoatTool
         {
             Text = "ESP32 小船 / 遥控器烧录配对工具";
             StartPosition = FormStartPosition.CenterScreen;
-            MinimumSize = new Size(1000, 720);
-            Size = new Size(1100, 780);
+            MinimumSize = new Size(980, 720);
+            Size = new Size(1060, 790);
+            AutoScaleMode = AutoScaleMode.None;
             Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Regular, GraphicsUnit.Point);
             BackColor = Color.FromArgb(246, 247, 250);
 
             TableLayoutPanel root = new TableLayoutPanel();
             root.Dock = DockStyle.Fill;
             root.ColumnCount = 1;
-            root.RowCount = 4;
+            root.RowCount = 5;
             root.RowStyles.Add(new RowStyle(SizeType.Absolute, 84));
-            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 300));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 92));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 232));
             root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
             root.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
             root.Padding = new Padding(12, 10, 12, 8);
             Controls.Add(root);
 
             root.Controls.Add(BuildHeader(), 0, 0);
-            root.Controls.Add(BuildPortPanel(), 0, 1);
-            root.Controls.Add(BuildActions(), 0, 2);
-            root.Controls.Add(statusLabel, 0, 3);
+            root.Controls.Add(BuildSuitePanel(), 0, 1);
+            root.Controls.Add(BuildPortPanel(), 0, 2);
+            root.Controls.Add(BuildActions(), 0, 3);
+            root.Controls.Add(statusLabel, 0, 4);
 
             statusLabel.Dock = DockStyle.Fill;
             statusLabel.TextAlign = ContentAlignment.MiddleLeft;
@@ -117,12 +125,54 @@ namespace BoatTool
             catalogLabel.Dock = DockStyle.Right;
             catalogLabel.Width = 470;
             catalogLabel.Font = new Font(Font.FontFamily, 8F, FontStyle.Regular);
-            catalogLabel.Text = "固件包 " + catalog.Version + Environment.NewLine +
-                               "中位 " + catalog.CenterUs + "us，左右各 " + catalog.SteerDeg + "°（" +
-                               catalog.AngleMin + "～" + catalog.AngleMax + "）" + Environment.NewLine +
-                               "脉宽 " + catalog.PulseMinUs + "～" + catalog.PulseMaxUs + "us，配对协议 v" + catalog.PairProtocol;
+            catalogLabel.Text = "固件套装：" + (library.Suites.Count > 0 ? "见下方选择" : "无可用套装");
             panel.Controls.Add(catalogLabel);
             return panel;
+        }
+
+        // 固件套装独立成组：这是“要写入什么”的唯一来源，避免和串口选择混在一起被误读。
+        private Control BuildSuitePanel()
+        {
+            GroupBox group = new GroupBox();
+            group.Text = "固件套装（决定写入哪一套固件；版本信息全部来自发布清单）";
+            group.Dock = DockStyle.Fill;
+            group.Padding = new Padding(10, 6, 10, 6);
+
+            TableLayoutPanel layout = new TableLayoutPanel();
+            layout.Dock = DockStyle.Fill;
+            layout.ColumnCount = 2;
+            layout.RowCount = 1;
+            layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 400));
+            layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            group.Controls.Add(layout);
+
+            FlowLayoutPanel left = new FlowLayoutPanel();
+            left.Dock = DockStyle.Fill;
+            left.FlowDirection = FlowDirection.LeftToRight;
+            left.WrapContents = false;
+            left.Padding = new Padding(0, 6, 0, 0);
+
+            Label suiteLabel = new Label();
+            suiteLabel.Text = "当前套装：";
+            suiteLabel.AutoSize = true;
+            suiteLabel.Margin = new Padding(0, 8, 4, 0);
+            left.Controls.Add(suiteLabel);
+
+            suiteChoice.DropDownStyle = ComboBoxStyle.DropDownList;
+            suiteChoice.Width = 290;
+            suiteChoice.Margin = new Padding(0, 4, 6, 0);
+            suiteChoice.SelectedIndexChanged += delegate { OnSuiteChanged(); };
+            left.Controls.Add(suiteChoice);
+            layout.Controls.Add(left, 0, 0);
+
+            suiteInfo.AutoSize = false;
+            suiteInfo.Dock = DockStyle.Fill;
+            suiteInfo.Font = new Font(Font.FontFamily, 8F, FontStyle.Regular);
+            suiteInfo.Padding = new Padding(8, 4, 4, 0);
+            suiteInfo.TextAlign = ContentAlignment.TopLeft;
+            suiteInfo.ForeColor = Color.FromArgb(60, 64, 72);
+            layout.Controls.Add(suiteInfo, 1, 0);
+            return group;
         }
 
         private Control BuildPortPanel()
@@ -146,13 +196,13 @@ namespace BoatTool
             portList.MultiSelect = false;
             portList.HideSelection = false;
             portList.GridLines = false;
-            portList.Columns.Add("串口", 70);
-            portList.Columns.Add("板子角色", 150);
-            portList.Columns.Add("芯片 MAC", 165);
-            portList.Columns.Add("固件版本", 230);
-            portList.Columns.Add("转向角度", 120);
-            portList.Columns.Add("对端地址", 150);
-            portList.Columns.Add("说明", 260);
+            portList.Columns.Add("串口", 64);
+            portList.Columns.Add("板子角色", 132);
+            portList.Columns.Add("芯片 MAC", 152);
+            portList.Columns.Add("固件版本", 168);
+            portList.Columns.Add("转向角度", 104);
+            portList.Columns.Add("对端地址", 152);
+            portList.Columns.Add("说明", 300);
             portList.SelectedIndexChanged += delegate { OnPortSelected(); };
             layout.Controls.Add(portList, 0, 0);
 
@@ -190,6 +240,17 @@ namespace BoatTool
             backupBeforeFlash.Margin = new Padding(12, 8, 0, 0);
             buttons.Controls.Add(backupBeforeFlash);
 
+            forceReflashCheck.Text = "即使已匹配也重刷";
+            forceReflashCheck.AutoSize = true;
+            forceReflashCheck.Checked = false;
+            forceReflashCheck.Margin = new Padding(12, 8, 0, 0);
+            forceReflashCheck.CheckedChanged += delegate
+            {
+                if (forceReflashCheck.Checked)
+                    AppendLog("已选择“即使已匹配也重刷”：套装一致时仍会写入，确认框会再次提示。");
+            };
+            buttons.Controls.Add(forceReflashCheck);
+
             layout.Controls.Add(buttons, 0, 1);
             return group;
         }
@@ -200,7 +261,7 @@ namespace BoatTool
             layout.Dock = DockStyle.Fill;
             layout.ColumnCount = 2;
             layout.RowCount = 1;
-            layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 330));
+            layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 300));
             layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
 
             GroupBox actionGroup = new GroupBox();
@@ -282,6 +343,114 @@ namespace BoatTool
             logGroup.Controls.Add(logBox);
             layout.Controls.Add(logGroup, 1, 0);
             return layout;
+        }
+
+        // 套装下拉：只列可用套装；不可用的也显示出来并标红说明原因，避免用户以为“没有这套”。
+        private void FillSuites()
+        {
+            suiteChoice.Items.Clear();
+            if (library.Suites.Count == 0)
+            {
+                suiteInfo.Text = "固件库里没有可用套装。";
+                suiteInfo.ForeColor = Color.FromArgb(178, 58, 40);
+                return;
+            }
+            int usableIndex = -1;
+            for (int i = 0; i < library.Suites.Count; i++)
+            {
+                FirmwareSuite suite = library.Suites[i];
+                SuiteItem item = new SuiteItem(suite);
+                suiteChoice.Items.Add(item);
+                if (suite.Usable && usableIndex < 0) usableIndex = i;
+            }
+            if (usableIndex >= 0) suiteChoice.SelectedIndex = usableIndex;
+            else suiteChoice.SelectedIndex = 0;
+            OnSuiteChanged();
+        }
+
+        private class SuiteItem
+        {
+            public readonly FirmwareSuite Suite;
+            public SuiteItem(FirmwareSuite suite) { Suite = suite; }
+            public override string ToString()
+            {
+                // 下拉里只放“转速 / 角度 + 版本”，完整 FWID 与清单摘要在右侧信息区。
+                if (Suite.Usable) return Suite.DisplayName + "（版本 " + Suite.Version + "）";
+                return Suite.Id + "（不可用）";
+            }
+        }
+
+        private FirmwareSuite currentSuite()
+        {
+            SuiteItem item = suiteChoice.SelectedItem as SuiteItem;
+            return item == null ? null : item.Suite;
+        }
+
+        private void OnSuiteChanged()
+        {
+            FirmwareSuite suite = currentSuite();
+            workflow.SelectedSuite = suite;
+            if (suite == null)
+            {
+                suiteInfo.Text = "未选择套装。";
+                suiteInfo.ForeColor = Color.FromArgb(178, 58, 40);
+            }
+            else if (!suite.Usable)
+            {
+                suiteInfo.Text = "这套不可用，已禁止烧录：" + string.Join("；", suite.Problems.ToArray());
+                suiteInfo.ForeColor = Color.FromArgb(178, 58, 40);
+            }
+            else
+            {
+                FirmwareSpec boat = suite.SpecFor(BoardRole.Boat);
+                FirmwareSpec remote = suite.SpecFor(BoardRole.Remote);
+                suiteInfo.Text = "版本 " + suite.Version + "｜目标 " + suite.SpeedText + "｜" + suite.SteerText +
+                                 Environment.NewLine + "小船  " + (boat == null ? "缺失" : boat.Fwid) +
+                                 Environment.NewLine + "遥控器  " + (remote == null ? "缺失" : remote.Fwid);
+                suiteInfo.ForeColor = Color.FromArgb(60, 64, 72);
+            }
+            UpdateActionState();
+            // 套装切换后重新给每块板标注“是否需要升级/是否属于另一套”。
+            RescanNotes();
+        }
+
+        // 不重新访问串口，只按已扫描到的身份重算说明文字。
+        private void RescanNotes()
+        {
+            foreach (ListViewItem item in portList.Items)
+            {
+                PortScan scan = item.Tag as PortScan;
+                if (scan == null) continue;
+                if (!scan.Responded) continue;
+                FirmwareSuite suite = workflow.SelectedSuite;
+                if (suite == null) continue;
+                FirmwareSpec spec = suite.SpecFor(scan.Identity.Role);
+                if (spec == null) continue;
+                string note;
+                if (string.Equals(scan.Identity.FirmwareId, spec.Fwid, StringComparison.Ordinal))
+                    note = "与所选套装一致，无需重复烧录";
+                else
+                {
+                    List<FirmwareSuite> owners = library.AllWithFwid(scan.Identity.Role, scan.Identity.FirmwareId);
+                    if (owners.Count > 0)
+                    {
+                        string names = "";
+                        foreach (FirmwareSuite owner in owners)
+                        {
+                            if (names.Length > 0) names += "、";
+                            names += owner.DisplayName;
+                        }
+                        FwidInfo info = FwidInfo.Parse(scan.Identity.FirmwareId);
+                        note = "板上是 " + names + (info.TargetRpm > 0 ? "（" + info.TargetRpm + " 转）" : "") +
+                               "，与所选套装不同";
+                    }
+                    else note = scan.Identity.HasFirmwareId ? "板上固件不在固件库中" : "板上无固件身份（旧版）";
+                }
+                if (note == item.SubItems[6].Text) continue;
+                item.SubItems[6].Text = note;
+                // 与所选套装不同就标黄提醒，但不算错误。
+                item.ForeColor = Color.FromArgb(150, 90, 0);
+            }
         }
 
         private void RefreshPorts()
@@ -412,13 +581,20 @@ namespace BoatTool
         private void RunFlash()
         {
             if (busy) return;
+            FirmwareSuite suite = currentSuite();
+            if (suite == null || !suite.Usable)
+            {
+                SetStatus("请先选择一个可用的固件套装", true);
+                return;
+            }
             PortScan scan = SelectedScan();
             if (scan == null) { SetStatus("请先选择一块板子的串口", true); return; }
             BoardRole role = scan.RememberedRole != BoardRole.Unknown ? scan.RememberedRole : ChosenRole();
-            SetBusy(true, "正在烧录……");
+            SetBusy(true, "正在烧录……（套装：" + suite.DisplayName + "）");
             try
             {
-                OperationResult result = workflow.FlashCurrent(scan, role, backupBeforeFlash.Checked);
+                OperationResult result = workflow.FlashCurrent(scan, role, backupBeforeFlash.Checked,
+                                                               forceReflashCheck.Checked);
                 ShowResult(result);
                 RefreshPorts();
             }
@@ -468,7 +644,7 @@ namespace BoatTool
             PortScan boatScan, remoteScan;
             scans.TryGetValue(boat, out boatScan);
             scans.TryGetValue(remote, out remoteScan);
-            SetBusy(true, "正在配对……");
+            SetBusy(true, "正在配对……（只改对端地址，不切换固件、不重刷）");
             try
             {
                 OperationResult result = workflow.PairTwoBoards(boatScan, remoteScan);
@@ -562,16 +738,30 @@ namespace BoatTool
         {
             busy = value;
             refreshButton.Enabled = !value;
-            flashButton.Enabled = !value && catalog.Problems.Count == 0;
+            suiteChoice.Enabled = !value;
             backupButton.Enabled = !value;
-            pairButton.Enabled = !value && catalog.Problems.Count == 0;
             boatPortChoice.Enabled = !value;
             remotePortChoice.Enabled = !value;
             backupBeforeFlash.Enabled = !value;
+            forceReflashCheck.Enabled = !value;
             if (value) roleChoice.Enabled = false;
             Cursor = value ? Cursors.WaitCursor : Cursors.Default;
             if (!string.IsNullOrEmpty(status)) SetStatus(status, false);
+            UpdateActionState();
             Application.DoEvents();
+        }
+
+        // 烧录需要可用套装；配对与备份不需要——配对只改地址，备份只读。
+        private void UpdateActionState()
+        {
+            FirmwareSuite suite = currentSuite();
+            bool suiteOk = suite != null && suite.Usable;
+            flashButton.Enabled = !busy && suiteOk;
+            pairButton.Enabled = !busy && library.Suites.Count > 0;
+            if (!busy && !suiteOk)
+                flashButton.Text = "烧录当前板（需先选可用套装）";
+            else
+                flashButton.Text = "烧录当前板";
         }
 
         private void SetStatus(string text, bool warn)
@@ -604,22 +794,58 @@ namespace BoatTool
 
         public bool ConfirmFlash(FlashPlan plan)
         {
+            FirmwareSpec spec = plan.Suite == null ? null : plan.Suite.SpecFor(plan.Role);
             StringBuilder text = new StringBuilder();
             text.AppendLine("即将烧录，请核对以下唯一目标：");
             text.AppendLine();
             text.AppendLine("串口（仅本次连接）：" + plan.Port);
             text.AppendLine("芯片 MAC（身份依据）：" + plan.Identity.MacText);
-            text.AppendLine("角色：" + RoleNames.Chinese(plan.Role));
-            text.AppendLine("板上当前固件：" + plan.Identity.FirmwareText);
+            text.AppendLine();
+            text.AppendLine("【板上现在】");
+            text.AppendLine("  角色：" + RoleNames.Chinese(plan.Role));
+            text.AppendLine("  目标转速：" + plan.BoardSpeedText);
+            text.AppendLine("  转向角度：" + plan.BoardSteerText);
+            text.AppendLine("  FWID：" + (string.IsNullOrEmpty(plan.BoardFwid) ? "无（旧版程序）" : plan.BoardFwid));
+            text.AppendLine();
+            text.AppendLine("【将写入】");
+            text.AppendLine("  套装：" + (plan.Suite == null ? "未选择" : plan.Suite.DisplayName));
+            text.AppendLine("  版本：" + plan.FirmwareVersion);
+            text.AppendLine("  角色：" + RoleNames.Chinese(plan.Role));
+            text.AppendLine("  目标转速：" + (plan.Suite == null ? "未知" : plan.Suite.TargetRpm + " 转"));
+            text.AppendLine("  转向角度：" + (plan.Suite == null ? "未知" : plan.Suite.SteerText));
+            text.AppendLine("  FWID：" + plan.Fwid);
+            text.AppendLine();
+            if (!string.IsNullOrEmpty(plan.CrossSuiteWarning))
+            {
+                text.AppendLine("【跨套装提示】");
+                text.AppendLine(plan.CrossSuiteWarning);
+                text.AppendLine();
+            }
+            if (plan.Downgrade)
+            {
+                text.AppendLine("【降级警告】");
+                text.AppendLine("写入后的目标转速低于板上现有固件。确认这是你要的结果，再继续。");
+                text.AppendLine();
+            }
+            if (plan.ExplicitReflash)
+            {
+                text.AppendLine("【明确重刷】");
+                text.AppendLine("你已勾选“即使已匹配也重刷”，即使板上固件与所选套装一致也会写入。");
+                text.AppendLine();
+            }
             text.AppendLine("为什么需要烧录：" + plan.Check.Reason);
-            text.AppendLine("将写入固件：" + plan.FirmwareVersion);
-            text.AppendLine("固件身份：" + plan.Fwid);
             text.AppendLine("烧录前备份：" + (plan.DoBackup ? "执行（8MB 约 3～5 分钟）" : "不执行（默认）"));
+            if (!string.IsNullOrEmpty(plan.NvsNote))
+            {
+                text.AppendLine();
+                text.AppendLine(plan.NvsNote);
+            }
             text.AppendLine();
             text.AppendLine("写入后会强制校验，并重启读回身份，才判定成功。");
             text.AppendLine("确认 MAC 与眼前这块板一致后再继续。");
-            return MessageBox.Show(this, text.ToString(), "确认烧录这一块板",
-                MessageBoxButtons.OKCancel, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) == DialogResult.OK;
+            return MessageBox.Show(this, text.ToString(),
+                plan.Downgrade ? "确认烧录（降级）" : "确认烧录这一块板",
+                MessageBoxButtons.OKCancel, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) == DialogResult.OK;
         }
 
         public bool ConfirmBackup(BackupPlan plan)
@@ -640,10 +866,16 @@ namespace BoatTool
             text.AppendLine("即将配对两块板，请核对：");
             text.AppendLine();
             text.AppendLine("小船：串口 " + plan.BoatPort + "，MAC " + plan.Boat.Mac);
+            text.AppendLine("  固件：" + plan.Boat.FirmwareText + "，" + plan.Boat.SteeringText);
+            text.AppendLine("  现在对端：" + plan.Boat.PeerText + (plan.SkipBoat ? "（已正确，本次跳过）" : "（将改为 " + plan.Remote.Mac + "）"));
             text.AppendLine("遥控器：串口 " + plan.RemotePort + "，MAC " + plan.Remote.Mac);
+            text.AppendLine("  固件：" + plan.Remote.FirmwareText + "，" + plan.Remote.SteeringText);
+            text.AppendLine("  现在对端：" + plan.Remote.PeerText + (plan.SkipRemote ? "（已正确，本次跳过）" : "（将改为 " + plan.Boat.Mac + "）"));
             text.AppendLine();
-            text.AppendLine("将把小船对端改为 " + plan.Remote.Mac + "，遥控器对端改为 " + plan.Boat.Mac + "。");
-            text.AppendLine("只修改持久配对地址，不重新烧录固件。");
+            text.AppendLine("兼容性：" + plan.Description);
+            text.AppendLine();
+            text.AppendLine("只修改两块板保存的对端地址：不切换固件套装、不重刷程序。");
+            text.AppendLine("已经指向正确对端的一端会跳过写入与重启。");
             text.AppendLine("写入前后都会按 MAC 核对；同一芯片或同一串口会被拒绝。");
             return MessageBox.Show(this, text.ToString(), "确认配对",
                 MessageBoxButtons.OKCancel, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) == DialogResult.OK;

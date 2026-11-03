@@ -21,51 +21,92 @@ namespace BoatTool
             }
 
             AppPaths paths = AppPaths.Detect();
-            FirmwareCatalog catalog = FirmwareCatalog.Load(paths.ManifestPath);
+            FirmwareLibrary library = FirmwareLibrary.Load(paths.FirmwareLibraryDir);
             RoleStore roles = new RoleStore(paths.RoleStorePath);
 
-            if (catalog.Problems.Count > 0)
+            StringBuilder warn = new StringBuilder();
+            foreach (string problem in library.Problems) warn.AppendLine("· " + problem);
+            foreach (FirmwareSuite suite in library.Suites)
             {
-                StringBuilder warn = new StringBuilder();
-                warn.AppendLine("工具包自检没有通过，为避免写错板子，烧录与配对已禁用：");
+                foreach (string problem in suite.Problems) warn.AppendLine("· 套装「" + suite.Id + "」：" + problem);
+            }
+            bool anyUsable = false;
+            foreach (FirmwareSuite suite in library.Suites) if (suite.Usable) { anyUsable = true; break; }
+
+            if (warn.Length > 0)
+            {
+                warn.Insert(0, "固件库自检发现问题，相关套装会显示为不可用（不可用的套装不能用来烧录）：" +
+                               Environment.NewLine + Environment.NewLine);
                 warn.AppendLine();
-                foreach (string problem in catalog.Problems) warn.AppendLine("· " + problem);
-                warn.AppendLine();
-                warn.AppendLine("请重新解压完整的原始 ZIP 包，不要单独复制本程序。");
-                MessageBox.Show(warn.ToString(), "工具包不完整", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                if (!anyUsable) warn.AppendLine("当前没有任何可用套装，烧录按钮已禁用。请使用完整解压的 ZIP。");
+                MessageBox.Show(warn.ToString(), anyUsable ? "部分套装不可用" : "没有可用固件套装",
+                    MessageBoxButtons.OK, anyUsable ? MessageBoxIcon.Warning : MessageBoxIcon.Error);
             }
 
             HardwareTransport transport = new HardwareTransport(paths, new SystemClock());
-            Application.Run(new MainForm(paths, catalog, roles, transport));
+            Application.Run(new MainForm(paths, library, roles, transport));
         }
 
-        // 供打包与交付后自检：不打开串口，只核对清单、镜像与 FWID。
+        // 供打包与交付后自检：不打开串口，只核对固件库、清单、镜像与 FWID。
         private static int RunSelfCheck(string root)
         {
             AppPaths paths = new AppPaths();
             paths.AppRoot = root;
-            paths.FirmwareDir = Path.Combine(root, "固件");
-            paths.ToolDir = Path.Combine(root, "工具");
-            paths.ManifestPath = Path.Combine(paths.FirmwareDir, "固件清单.json");
-            paths.EsptoolPath = Path.Combine(paths.ToolDir, "esptool.exe");
+            paths.FirmwareLibraryDir = Path.Combine(root, "固件库");
 
-            FirmwareCatalog catalog = FirmwareCatalog.Load(paths.ManifestPath);
+            FirmwareLibrary library = FirmwareLibrary.Load(paths.FirmwareLibraryDir);
             StringBuilder text = new StringBuilder();
-            text.AppendLine("固件包：" + catalog.Version);
-            text.AppendLine(catalog.Summary);
-            foreach (string problem in catalog.Problems) text.AppendLine("问题：" + problem);
-            foreach (BoardRole role in new BoardRole[] { BoardRole.Boat, BoardRole.Remote })
+            text.AppendLine("固件库：" + library.Root);
+            foreach (string problem in library.Problems) text.AppendLine("固件库问题：" + problem);
+
+            int usable = 0;
+            foreach (FirmwareSuite suite in library.Suites)
             {
-                FirmwareSpec spec = catalog.ForRole(role);
-                text.AppendLine(RoleNames.Chinese(role) + "：" + (spec == null ? "缺失" : spec.Fwid + " / " + spec.Version));
-                if (spec != null) text.AppendLine("  写入位置：" + spec.DescribeImages());
+                text.AppendLine();
+                text.AppendLine("套装 " + suite.Id + "：" + (suite.Usable ? "可用" : "不可用"));
+                if (!string.IsNullOrEmpty(suite.DisplayName)) text.AppendLine("  显示名：" + suite.DisplayName);
+                text.AppendLine("  版本：" + suite.Version + "，目标 " + suite.TargetRpm + " 转，左右各 " + suite.SteerDeg + "°");
+                if (suite.Catalog != null) text.AppendLine("  " + suite.Catalog.Summary);
+                foreach (BoardRole role in new BoardRole[] { BoardRole.Boat, BoardRole.Remote })
+                {
+                    FirmwareSpec spec = suite.SpecFor(role);
+                    text.AppendLine("  " + RoleNames.Chinese(role) + "：" +
+                                    (spec == null ? "缺失" : spec.Fwid + " / " + spec.Version));
+                    if (spec != null) text.AppendLine("    写入位置：" + spec.DescribeImages());
+                    PartitionLayout layout = suite.LayoutFor(role);
+                    if (layout != null)
+                        text.AppendLine("    " + (string.IsNullOrEmpty(layout.Error) ? "分区：" + layout.DescribeNvs() : "分区问题：" + layout.Error));
+                }
+                text.AppendLine("  esptool：" + (File.Exists(suite.EsptoolPath) ? "存在" : "缺失"));
+                foreach (string problem in suite.Problems) text.AppendLine("  问题：" + problem);
+                if (suite.Usable) usable++;
             }
-            text.AppendLine("esptool：" + (File.Exists(paths.EsptoolPath) ? "存在" : "缺失"));
-            text.AppendLine(catalog.Problems.Count == 0 ? "结论：自检通过" : "结论：自检未通过");
+
+            // 两套镜像不能混用：同一角色在两个套装里的应用镜像不能是同一个文件。
+            for (int i = 0; i < library.Suites.Count; i++)
+            {
+                for (int j = i + 1; j < library.Suites.Count; j++)
+                {
+                    foreach (BoardRole role in new BoardRole[] { BoardRole.Boat, BoardRole.Remote })
+                    {
+                        FirmwareSpec a = library.Suites[i].SpecFor(role);
+                        FirmwareSpec b = library.Suites[j].SpecFor(role);
+                        if (a == null || b == null) continue;
+                        if (string.Equals(a.AppPath, b.AppPath, StringComparison.OrdinalIgnoreCase))
+                            text.AppendLine("镜像混用：套装 " + library.Suites[i].Id + " 与 " + library.Suites[j].Id +
+                                            " 的" + RoleNames.Chinese(role) + "镜像路径相同");
+                    }
+                }
+            }
+
+            text.AppendLine();
+            text.AppendLine("可用套装数：" + usable + " / " + library.Suites.Count);
+            bool ok = library.Problems.Count == 0 && usable > 0 && usable == library.Suites.Count;
+            text.AppendLine(ok ? "结论：自检通过" : "结论：自检未通过");
 
             string report = Path.Combine(root, "自检报告.txt");
             File.WriteAllText(report, text.ToString(), new UTF8Encoding(false));
-            return catalog.Problems.Count == 0 ? 0 : 2;
+            return ok ? 0 : 2;
         }
     }
 }

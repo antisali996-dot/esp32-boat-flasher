@@ -1,0 +1,16 @@
+{
+  "source_repository": "https://github.com/antisali996-dot/esp32-boat-control.git",
+  "source_commit": "3bd27e875a2a440ed1a24da9daa98e9f5fdfae24",
+  "migration": "copy, original files preserved",
+  "files": {
+    "FirmwareCatalog.cs": "052638b119cd00e7975411ce334c57667314de6327a98456d2840aeba2d9d4ef",
+    "HardwareTransport.cs": "fbeb9fac26f873d8c5ddba5142d1838cfe5c4bbd3f0116ccc6f9c510ebd47719",
+    "Json.cs": "3ec115b477d341db42ce099de51eb5fbc81f745d3894aae9820b7c70f4906a55",
+    "MainForm.cs": "9bb34dee8792d6069529bdfa238abab943bb24b57a5aefa29779dfb937c529cf",
+    "Model.cs": "58891bdcbae7ab90fcf057ae413c9432f78bd1455edf471ab71665c640117820",
+    "Program.cs": "6dcbdb0de54a15baa9a394cb3584b7e1144f3741c8b30b2db4d854c2e4085f03",
+    "RoleStore.cs": "df27801b9c4d586600acd4dc8fcf148bbe45f6c84df3d3f2c75dcf3ee211b82f",
+    "Transport.cs": "c63e00cb06f89470318d730086b33aa7f9312abe3bcd68d7cf7b43fa3482bcaa",
+    "Workflow.cs": "4478069e135c7f9aaca5a2e3e5678e4b2ef3a23aab2c0ff448849fcc88564e41"
+  }
+}

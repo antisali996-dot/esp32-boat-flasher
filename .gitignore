@@ -1,0 +1,9 @@
+/work/
+/firmware-library/
+/dist/
+/config/
+/records/
+*.exe
+*.bin
+*.zip
+*.log

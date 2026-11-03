@@ -26,11 +26,39 @@ namespace BoatTool
         private readonly Button refreshButton = new Button();
         private readonly Button flashButton = new Button();
         private readonly Button pairButton = new Button();
+        private readonly Button verifyButton = new Button();
         private readonly Button backupButton = new Button();
         private readonly RichTextBox logBox = new RichTextBox();
         private readonly Label statusLabel = new Label();
         private readonly Label catalogLabel = new Label();
         private readonly Dictionary<string, PortScan> scans = new Dictionary<string, PortScan>(StringComparer.OrdinalIgnoreCase);
+        // ---- 现场诊断 ----
+        private readonly TabControl mainTabs = new TabControl();
+        private readonly ComboBox diagPortChoice = new ComboBox();
+        private readonly Button diagConnectButton = new Button();
+        private readonly Button diagStartButton = new Button();
+        private readonly Button diagStopExportButton = new Button();
+        private readonly Button diagMarkerStopButton = new Button();
+        private readonly Button diagMarkerRestartButton = new Button();
+        private readonly Button diagMarkerServoButton = new Button();
+        private readonly Button diagOpenFolderButton = new Button();
+        private readonly Label diagStateLabel = new Label();
+        private readonly Label diagConnLabel = new Label();
+        private readonly Label diagRecLabel = new Label();
+        private readonly Label diagRoleLabel = new Label();
+        private readonly Label diagMacLabel = new Label();
+        private readonly Label diagFwidLabel = new Label();
+        private readonly Label diagResetLabel = new Label();
+        private readonly Label diagRunLabel = new Label();
+        private readonly Label diagDirLabel = new Label();
+        private readonly Label diagSupportLabel = new Label();
+        private readonly Label diagFaultLabel = new Label();
+        private readonly TextBox diagLogBox = new TextBox();
+        private readonly System.Windows.Forms.Timer diagTimer = new System.Windows.Forms.Timer();
+        private readonly PortLockRegistry portLocks = new PortLockRegistry();
+        private DiagnosticsController diag;
+        // 只对获批 r10 快照开放自动查询；白名单为空时保持纯被动记录。
+        private QueryPolicy diagPolicy = QueryPolicy.ApprovedR11();
         private bool busy;
 
         public MainForm(AppPaths paths, FirmwareLibrary library, RoleStore roles, IBoardTransport transport)
@@ -53,9 +81,9 @@ namespace BoatTool
             if (library.Suites.Count == 0 || currentSuite() == null)
                 SetStatus("没有可用的固件套装，烧录与配对已禁用", true);
             if (!string.IsNullOrEmpty(roles.LoadError)) AppendLog(roles.LoadError);
-            if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("BOATTOOL_NO_AUTOSCAN")))
+            if (NoDeviceMode)
             {
-                AppendLog("已按环境变量跳过自动扫描串口（测试模式）。");
+                AppendLog("已按环境变量跳过自动扫描串口（测试模式），现场诊断页也不会枚举串口。");
                 return;
             }
             RefreshPorts();
@@ -71,6 +99,14 @@ namespace BoatTool
             Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Regular, GraphicsUnit.Point);
             BackColor = Color.FromArgb(246, 247, 250);
 
+            mainTabs.Dock = DockStyle.Fill;
+            mainTabs.Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Regular, GraphicsUnit.Point);
+            Controls.Add(mainTabs);
+
+            TabPage flashPage = new TabPage("烧录与配对");
+            flashPage.BackColor = Color.FromArgb(246, 247, 250);
+            mainTabs.TabPages.Add(flashPage);
+
             TableLayoutPanel root = new TableLayoutPanel();
             root.Dock = DockStyle.Fill;
             root.ColumnCount = 1;
@@ -81,7 +117,7 @@ namespace BoatTool
             root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
             root.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
             root.Padding = new Padding(12, 10, 12, 8);
-            Controls.Add(root);
+            flashPage.Controls.Add(root);
 
             root.Controls.Add(BuildHeader(), 0, 0);
             root.Controls.Add(BuildSuitePanel(), 0, 1);
@@ -89,11 +125,441 @@ namespace BoatTool
             root.Controls.Add(BuildActions(), 0, 3);
             root.Controls.Add(statusLabel, 0, 4);
 
+            TabPage diagPage = new TabPage("现场诊断");
+            diagPage.BackColor = Color.FromArgb(246, 247, 250);
+            mainTabs.TabPages.Add(diagPage);
+            diagPage.Controls.Add(BuildDiagnosticsPage());
+            mainTabs.SelectedIndexChanged += delegate
+            {
+                if (mainTabs.SelectedTab == diagPage) RefreshDiagPorts();
+            };
+            // 无设备检查时可以直接定位到诊断页（仅界面选择，不访问设备）。
+            if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("BOATTOOL_OPEN_DIAG")))
+                mainTabs.SelectedTab = diagPage;
+
             statusLabel.Dock = DockStyle.Fill;
             statusLabel.TextAlign = ContentAlignment.MiddleLeft;
             statusLabel.ForeColor = Color.FromArgb(60, 64, 72);
             statusLabel.Padding = new Padding(2, 6, 2, 0);
             statusLabel.Text = "请先断开动力电池，只保留 USB 供电；识别串口时板子可能复位。记录目录在“记录”文件夹。";
+        }
+
+        // ---------- 现场诊断页 ----------
+        private Control BuildDiagnosticsPage()
+        {
+            TableLayoutPanel root = new TableLayoutPanel();
+            root.Dock = DockStyle.Fill;
+            root.ColumnCount = 2;
+            root.RowCount = 1;
+            root.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 420));
+            root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            root.Padding = new Padding(12, 10, 12, 8);
+
+            GroupBox left = new GroupBox();
+            left.Text = "现场诊断（只读记录，不烧录、不改参数）";
+            left.Dock = DockStyle.Fill;
+            left.Padding = new Padding(10, 6, 10, 6);
+
+            TableLayoutPanel l = new TableLayoutPanel();
+            l.Dock = DockStyle.Fill;
+            l.ColumnCount = 1;
+            l.RowCount = 8;
+            l.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
+            l.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
+            l.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
+            l.RowStyles.Add(new RowStyle(SizeType.Absolute, 104));
+            l.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
+            l.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
+            l.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            l.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
+            left.Controls.Add(l);
+
+            FlowLayoutPanel portRow = new FlowLayoutPanel();
+            portRow.Dock = DockStyle.Fill;
+            portRow.FlowDirection = FlowDirection.LeftToRight;
+            portRow.WrapContents = false;
+            Label pl = new Label();
+            pl.Text = "串口：";
+            pl.AutoSize = true;
+            pl.Margin = new Padding(0, 8, 2, 0);
+            portRow.Controls.Add(pl);
+            diagPortChoice.DropDownStyle = ComboBoxStyle.DropDownList;
+            diagPortChoice.Width = 140;
+            diagPortChoice.Margin = new Padding(0, 4, 6, 0);
+            portRow.Controls.Add(diagPortChoice);
+            diagOpenFolderButton.Text = "打开记录目录";
+            diagOpenFolderButton.Width = 118;
+            diagOpenFolderButton.Height = 26;
+            diagOpenFolderButton.Margin = new Padding(0, 3, 0, 0);
+            diagOpenFolderButton.Click += delegate { OpenDiagnosticsFolder(); };
+            portRow.Controls.Add(diagOpenFolderButton);
+            l.Controls.Add(portRow, 0, 0);
+
+            diagConnectButton.Text = "1. 连接并核对版本";
+            diagConnectButton.Dock = DockStyle.Fill;
+            diagConnectButton.Click += delegate { DiagConnect(); };
+            l.Controls.Add(diagConnectButton, 0, 1);
+
+            diagStartButton.Text = "2. 开始记录";
+            diagStartButton.Dock = DockStyle.Fill;
+            diagStartButton.Click += delegate { DiagStart(); };
+            l.Controls.Add(diagStartButton, 0, 2);
+
+            GroupBox markerBox = new GroupBox();
+            markerBox.Text = "3. 标记异常（只写本地，不发串口命令）";
+            markerBox.Dock = DockStyle.Fill;
+            FlowLayoutPanel markers = new FlowLayoutPanel();
+            markers.Dock = DockStyle.Fill;
+            markers.FlowDirection = FlowDirection.LeftToRight;
+            markers.WrapContents = true;
+            diagMarkerStopButton.Text = "电机停下";
+            diagMarkerStopButton.Width = 120;
+            diagMarkerStopButton.Height = 30;
+            diagMarkerStopButton.Click += delegate { DiagMarker(MarkerKind.MotorStopped); };
+            markers.Controls.Add(diagMarkerStopButton);
+            diagMarkerRestartButton.Text = "电机重新启动";
+            diagMarkerRestartButton.Width = 120;
+            diagMarkerRestartButton.Height = 30;
+            diagMarkerRestartButton.Click += delegate { DiagMarker(MarkerKind.MotorRestarted); };
+            markers.Controls.Add(diagMarkerRestartButton);
+            diagMarkerServoButton.Text = "舵机微动";
+            diagMarkerServoButton.Width = 120;
+            diagMarkerServoButton.Height = 30;
+            diagMarkerServoButton.Click += delegate { DiagMarker(MarkerKind.ServoMicroMove); };
+            markers.Controls.Add(diagMarkerServoButton);
+            markerBox.Controls.Add(markers);
+            l.Controls.Add(markerBox, 0, 3);
+
+            diagStopExportButton.Text = "4. 停止并导出";
+            diagStopExportButton.Dock = DockStyle.Fill;
+            diagStopExportButton.Click += delegate { DiagStopAndExport(); };
+            l.Controls.Add(diagStopExportButton, 0, 4);
+
+            diagStateLabel.AutoSize = false;
+            diagStateLabel.Dock = DockStyle.Fill;
+            diagStateLabel.Text = "状态：未连接";
+            diagStateLabel.ForeColor = Color.FromArgb(60, 64, 72);
+            l.Controls.Add(diagStateLabel, 0, 5);
+
+            GroupBox infoBox = new GroupBox();
+            infoBox.Text = "当前设备与接口";
+            infoBox.Dock = DockStyle.Fill;
+            TableLayoutPanel info = new TableLayoutPanel();
+            info.Dock = DockStyle.Fill;
+            info.ColumnCount = 1;
+            info.RowCount = 8;
+            info.Padding = new Padding(6, 4, 4, 4);
+            infoBox.Controls.Add(info);
+            diagRoleLabel.Dock = DockStyle.Fill; diagRoleLabel.Text = "角色：未知"; info.Controls.Add(diagRoleLabel, 0, 0);
+            diagMacLabel.Dock = DockStyle.Fill; diagMacLabel.Text = "自身 MAC：未知"; info.Controls.Add(diagMacLabel, 0, 1);
+            diagFwidLabel.Dock = DockStyle.Fill; diagFwidLabel.Text = "FWID：未知"; info.Controls.Add(diagFwidLabel, 0, 2);
+            diagResetLabel.Dock = DockStyle.Fill; diagResetLabel.Text = "最近一次复位原因：未知"; info.Controls.Add(diagResetLabel, 0, 3);
+            diagRunLabel.Dock = DockStyle.Fill; diagRunLabel.Text = "最近一次可识别运行状态：未知"; info.Controls.Add(diagRunLabel, 0, 4);
+            diagDirLabel.Dock = DockStyle.Fill; diagDirLabel.Text = "本地记录目录：未开始"; info.Controls.Add(diagDirLabel, 0, 5);
+            diagSupportLabel.Dock = DockStyle.Fill; diagSupportLabel.Text = "接口支持：未确认"; diagSupportLabel.ForeColor = Color.FromArgb(150, 90, 0);
+            info.Controls.Add(diagSupportLabel, 0, 6);
+            // 故障证据状态：只展示关联结果，不提供任何控制操作。
+            diagFaultLabel.Dock = DockStyle.Fill;
+            diagFaultLabel.Text = "故障证据：尚未收到 FAULT 行";
+            diagFaultLabel.ForeColor = Color.FromArgb(60, 64, 72);
+            info.Controls.Add(diagFaultLabel, 0, 7);
+            l.Controls.Add(infoBox, 0, 6);
+
+            Label note = new Label();
+            note.Dock = DockStyle.Fill;
+            note.Text = "提示：软件保持 DTR、RTS 为 false，但不能保证所有 USB 串口硬件在打开连接时都绝不复位。";
+            note.ForeColor = Color.FromArgb(120, 70, 30);
+            note.AutoSize = false;
+            l.Controls.Add(note, 0, 7);
+
+            root.Controls.Add(left, 0, 0);
+
+            GroupBox logGroup = new GroupBox();
+            logGroup.Text = "诊断过程（同样写入本地记录目录）";
+            logGroup.Dock = DockStyle.Fill;
+            logGroup.Padding = new Padding(8);
+            diagLogBox.Dock = DockStyle.Fill;
+            diagLogBox.Multiline = true;
+            diagLogBox.ScrollBars = ScrollBars.Vertical;
+            diagLogBox.ReadOnly = true;
+            diagLogBox.BackColor = Color.White;
+            diagLogBox.Font = new Font("Consolas", 9F, FontStyle.Regular, GraphicsUnit.Point);
+            logGroup.Controls.Add(diagLogBox);
+            root.Controls.Add(logGroup, 1, 0);
+
+            diagTimer.Interval = 100;
+            diagTimer.Tick += delegate { DiagTick(); };
+            UpdateDiagButtons();
+            return root;
+        }
+
+        private void DiagAppend(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return;
+            diagLogBox.AppendText("[" + DateTime.Now.ToString("HH:mm:ss") + "] " + text + Environment.NewLine);
+            diagLogBox.SelectionStart = diagLogBox.TextLength;
+            diagLogBox.ScrollToCaret();
+        }
+
+        // 无设备模式：连串口名称都不枚举，确保不会触碰任何设备。
+        private static bool NoDeviceMode
+        {
+            get { return !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("BOATTOOL_NO_AUTOSCAN")); }
+        }
+
+        private void RefreshDiagPorts()
+        {
+            if (NoDeviceMode) return;
+            if (diag != null && diag.State == DiagState.Recording) return;
+            string keep = diagPortChoice.SelectedItem as string;
+            diagPortChoice.Items.Clear();
+            try
+            {
+                foreach (string p in System.IO.Ports.SerialPort.GetPortNames()) diagPortChoice.Items.Add(p);
+            }
+            catch (Exception ex)
+            {
+                DiagAppend("枚举串口失败：" + ex.Message);
+            }
+            if (keep != null && diagPortChoice.Items.Contains(keep)) diagPortChoice.SelectedItem = keep;
+            else if (diagPortChoice.Items.Count > 0) diagPortChoice.SelectedIndex = 0;
+        }
+
+        private void EnsureDiag()
+        {
+            if (diag != null) return;
+            IDiagChannel channel = new SerialDiagChannel(115200, DiagAppend);
+            diag = new DiagnosticsController(paths, channel, new SystemDiagClock(), diagPolicy, DiagAppend);
+            diag.PortLocks = portLocks;
+            workflow.PortLocks = portLocks;
+        }
+
+        // 真实按钮分派：与测试共用 DiagButtonActions，不存在第二套逻辑。
+        private void DiagConnect()
+        {
+            EnsureDiag();
+            string port = diagPortChoice.SelectedItem as string;
+            if (string.IsNullOrEmpty(port)) { DiagAppend("请先选择串口。"); return; }
+
+            DiagConnectOutcome outcome = DiagButtonActions.ConnectOrReconnect(diag, port);
+            switch (outcome)
+            {
+                case DiagConnectOutcome.Connected:
+                    DiagAppend("已连接并核对版本。可以点“开始记录”。");
+                    break;
+                case DiagConnectOutcome.Reconnected:
+                    DiagAppend("已重连到原会话，继续记录（无需再点“开始记录”）。");
+                    if (!diagTimer.Enabled) diagTimer.Start();
+                    break;
+                case DiagConnectOutcome.RefusedRecording:
+                    DiagAppend("正在记录中，未重复连接。需要重连请先等待掉线，或停止后再操作。");
+                    break;
+                case DiagConnectOutcome.NoPort:
+                    DiagAppend("请先选择串口。");
+                    break;
+                default:
+                    DiagAppend("重连/连接未完成：" + DiagStateText.Chinese(diag.State) +
+                               "。原会话与已保存文件仍保留，可重试或“停止并导出”。");
+                    break;
+            }
+            UpdateDiagLabels();
+            UpdateDiagButtons();
+        }
+
+        private void DiagStart()
+        {
+            EnsureDiag();
+            if (diag == null) return;
+            DiagStartOutcome outcome = DiagButtonActions.StartNewOrResume(diag);
+            switch (outcome)
+            {
+                case DiagStartOutcome.Started:
+                    diagTimer.Start();
+                    DiagAppend("已开始新的记录会话。");
+                    break;
+                case DiagStartOutcome.RefusedRecording:
+                    DiagAppend("已经在记录中，未创建第二个会话。");
+                    break;
+                case DiagStartOutcome.RefusedUnclosedSession:
+                    DiagAppend("上一会话尚未关闭：请先“停止并导出”，或直接重连继续原会话；" +
+                               "不会自动新建会话覆盖旧记录。");
+                    break;
+                default:
+                    DiagAppend("尚未连接，无法开始记录。");
+                    break;
+            }
+            UpdateDiagLabels();
+            UpdateDiagButtons();
+        }
+
+        private void DiagTick()
+        {
+            if (diag == null) return;
+            try { diag.Pump(); }
+            catch (Exception ex) { DiagAppend("采集异常：" + ex.Message); }
+            UpdateDiagLabels();
+            UpdateDiagButtons();
+        }
+
+        private void DiagMarker(MarkerKind kind)
+        {
+            if (diag == null) { DiagAppend("尚未开始记录，标记未保存。"); return; }
+            diag.AddMarker(kind);
+            UpdateDiagLabels();
+        }
+
+        private void DiagStopAndExport()
+        {
+            if (diag == null || diag.Session == null) { DiagAppend("没有可导出的记录。"); return; }
+            diagTimer.Stop();
+            List<string> stopErrors = diag.StopRecording();
+            foreach (string e in stopErrors) DiagAppend("停止时出现异常：" + e);
+            UpdateDiagLabels();
+            UpdateDiagButtons();
+
+            using (SaveFileDialog dlg = new SaveFileDialog())
+            {
+                dlg.Title = "导出诊断记录";
+                dlg.Filter = "ZIP 压缩包 (*.zip)|*.zip";
+                dlg.FileName = diag.Session.SessionId + ".zip";
+                if (dlg.ShowDialog(this) != DialogResult.OK)
+                {
+                    DiagAppend("已取消导出。本地记录仍保留在：" + diag.Session.RootDir);
+                    return;
+                }
+                ExportResult result = DiagnosticsExporter.Export(diag.Session, paths, AppVersion(), DateTime.Now);
+                if (!result.Ok)
+                {
+                    DiagAppend("导出失败：" + result.Error);
+                    MessageBox.Show(this, result.Error + Environment.NewLine + Environment.NewLine +
+                        "原始记录保留在：" + diag.Session.RootDir + Environment.NewLine + "可以重新导出。",
+                        "导出失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+                try
+                {
+                    if (File.Exists(dlg.FileName)) File.Delete(dlg.FileName);
+                    File.Move(result.ZipPath, dlg.FileName);
+                }
+                catch (Exception ex)
+                {
+                    DiagAppend("移动导出文件失败：" + ex.Message + "（临时文件：" + result.ZipPath + "）");
+                    return;
+                }
+                DiagAppend("导出完成：" + dlg.FileName);
+                DiagAppend("SHA256：" + DiagnosticsExporter.Sha256File(dlg.FileName));
+                MessageBox.Show(this,
+                    "导出完成：" + Environment.NewLine + dlg.FileName + Environment.NewLine + Environment.NewLine +
+                    "SHA256：" + DiagnosticsExporter.Sha256File(dlg.FileName) + Environment.NewLine +
+                    "大小：" + new FileInfo(dlg.FileName).Length + " 字节" + Environment.NewLine + Environment.NewLine +
+                    "本导出只包含工具实际接收到的数据，不代表已找到根因或问题已解决。",
+                    "导出完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+        }
+
+        private void OpenDiagnosticsFolder()
+        {
+            try
+            {
+                string dir = diag != null && diag.Session != null
+                    ? diag.Session.RootDir
+                    : Path.Combine(paths.WritableRoot, "诊断记录");
+                Directory.CreateDirectory(dir);
+                System.Diagnostics.Process.Start("explorer.exe", "\"" + dir + "\"");
+            }
+            catch (Exception ex) { DiagAppend("打开目录失败：" + ex.Message); }
+        }
+
+        private string AppVersion()
+        {
+            return "esp32-boat-flasher/诊断-" + System.Reflection.Assembly.GetExecutingAssembly().GetName().Version;
+        }
+
+        private void UpdateDiagLabels()
+        {
+            if (diag == null)
+            {
+                diagStateLabel.Text = "状态：未连接";
+                return;
+            }
+            diagStateLabel.Text = "状态：" + DiagStateText.Chinese(diag.State);
+            diagStateLabel.ForeColor = diag.State == DiagState.Recording
+                ? Color.FromArgb(20, 110, 60) : Color.FromArgb(60, 64, 72);
+            BoardIdentity id = diag.Identity;
+            diagRoleLabel.Text = "角色：" + (id == null ? "未知" : id.RoleText);
+            diagMacLabel.Text = "自身 MAC：" + (id == null || string.IsNullOrEmpty(id.Mac) ? "未知" : id.Mac);
+            diagFwidLabel.Text = "FWID：" + (id == null || !id.HasFirmwareId ? "未知" : id.FirmwareId);
+            diagResetLabel.Text = "最近一次复位原因：" +
+                (string.IsNullOrEmpty(diag.LastResetReason) ? "未知（板子未输出）" : diag.LastResetReason);
+            diagRunLabel.Text = "最近一次可识别运行状态：" +
+                (string.IsNullOrEmpty(diag.LastRunState) ? "未知" : diag.LastRunState);
+            diagDirLabel.Text = "本地记录目录：" + (diag.Session == null ? "未开始" : diag.Session.RootDir);
+            BoardRole role = id == null ? BoardRole.Unknown : id.Role;
+            bool confirmed = diagPolicy.Allows(id != null && id.HasFirmwareId ? id.FirmwareId : "", role);
+            if (confirmed)
+            {
+                diagSupportLabel.Text = "接口支持：已确认白名单（记录中会低频查询 COUNT/FAULT）";
+            }
+            else if (role == BoardRole.Remote)
+            {
+                diagSupportLabel.Text = "接口支持：遥控器不提供 COUNT/FAULT（只被动记录）";
+            }
+            else
+            {
+                diagSupportLabel.Text = "接口支持：未确认（只被动记录，不自动发送 COUNT/FAULT）";
+            }
+            diagSupportLabel.ForeColor = confirmed ? Color.FromArgb(20, 110, 60) : Color.FromArgb(150, 90, 0);
+
+            // 故障证据：只读汇总 + 最近一行的状态（完整/不完整/冲突/启动未确认/待适配）。
+            FaultSnapshot latest = diag.LatestFault;
+            if (latest == null)
+            {
+                diagFaultLabel.Text = "故障证据：尚未收到 FAULT 行";
+                diagFaultLabel.ForeColor = Color.FromArgb(60, 64, 72);
+            }
+            else
+            {
+                string groupText;
+                if (latest.Group != null)
+                    groupText = "id=" + latest.Group.Id + " " + latest.Group.DescribeState();
+                else if (latest.Kind == "NONE")
+                    groupText = "板上报告无故障（保留历史故障与冲突）";
+                else if (latest.Kind == "UNSUPPORTED")
+                    groupText = "接口不支持 FAULT 查询";
+                else if (latest.State == FaultAdapterState.Malformed)
+                    groupText = "解析失败（" +
+                        (string.IsNullOrEmpty(latest.ParseFailureField) ? "字段格式不符合协议"
+                            : "字段 " + latest.ParseFailureField + " " + latest.ParseFailureReason) +
+                        "），不计入有效证据";
+                else
+                    groupText = "待适配（未识别格式）";
+                diagFaultLabel.Text = "故障证据：" + groupText + "｜汇总：" + diag.FaultSummary;
+                diagFaultLabel.ForeColor =
+                    latest.Group != null && latest.Group.State == FaultGroupState.Complete
+                        ? Color.FromArgb(20, 110, 60)
+                        : (latest.Group != null && latest.Group.State == FaultGroupState.Conflicting
+                            ? Color.FromArgb(178, 58, 40) : Color.FromArgb(150, 90, 0));
+            }
+            diagFaultLabel.Text = diagFaultLabel.Text +
+                "（证据完整只表示两行配套，不代表根因成立或问题已解决）";
+        }
+
+        private void UpdateDiagButtons()
+        {
+            DiagState st = diag == null ? DiagState.NotConnected : diag.State;
+            bool idle = st == DiagState.NotConnected || st == DiagState.Connected ||
+                        st == DiagState.ConnectFailed || st == DiagState.Disconnected ||
+                        st == DiagState.WaitingReconnect;
+            diagConnectButton.Enabled = st != DiagState.Recording && st != DiagState.Stopped;
+            diagStartButton.Enabled = st == DiagState.Connected;
+            bool recording = st == DiagState.Recording;
+            diagMarkerStopButton.Enabled = recording;
+            diagMarkerRestartButton.Enabled = recording;
+            diagMarkerServoButton.Enabled = recording;
+            diagStopExportButton.Enabled = recording || st == DiagState.Disconnected ||
+                                           st == DiagState.WaitingReconnect ||
+                                           (diag != null && diag.Session != null && st == DiagState.Stopped);
+            diagPortChoice.Enabled = idle;
         }
 
         private Control BuildHeader()
@@ -128,6 +594,16 @@ namespace BoatTool
             catalogLabel.Text = "固件套装：" + (library.Suites.Count > 0 ? "见下方选择" : "无可用套装");
             panel.Controls.Add(catalogLabel);
             return panel;
+        }
+
+        // 分类包：把预设交给 Workflow 做芯片地址核对，并在标题与日志里明确标出。
+        public void ApplyPreset(PresetConfig preset)
+        {
+            if (preset == null || preset.Problems.Count > 0) return;
+            workflow.Preset = preset;
+            Text = "ESP32 小船 / 遥控器烧录配对工具（" + preset.Title + "）";
+            AppendLog("分类包预设：" + preset.Describe());
+            AppendLog("本包只允许操作上述两块芯片；地址不符会拒绝写入与绑定。");
         }
 
         // 固件套装独立成组：这是“要写入什么”的唯一来源，避免和串口选择混在一起被误读。
@@ -321,11 +797,25 @@ namespace BoatTool
             ports.Controls.Add(remotePortChoice);
             actions.Controls.Add(ports, 0, 3);
 
+            TableLayoutPanel pairRow = new TableLayoutPanel();
+            pairRow.Dock = DockStyle.Fill;
+            pairRow.ColumnCount = 2;
+            pairRow.RowCount = 1;
+            pairRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            pairRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 118));
+
             pairButton.Text = "配对两块板";
             pairButton.Dock = DockStyle.Fill;
             pairButton.Font = new Font(Font.FontFamily, 10F, FontStyle.Bold);
             pairButton.Click += delegate { RunPair(); };
-            actions.Controls.Add(pairButton, 0, 4);
+            pairRow.Controls.Add(pairButton, 0, 0);
+
+            verifyButton.Text = "只读核验";
+            verifyButton.Dock = DockStyle.Fill;
+            verifyButton.Margin = new Padding(6, 0, 0, 0);
+            verifyButton.Click += delegate { RunVerify(); };
+            pairRow.Controls.Add(verifyButton, 1, 0);
+            actions.Controls.Add(pairRow, 0, 4);
 
             actionGroup.Controls.Add(actions);
             layout.Controls.Add(actionGroup, 0, 0);
@@ -356,13 +846,19 @@ namespace BoatTool
                 return;
             }
             int usableIndex = -1;
+            int preferredIndex = -1;
             for (int i = 0; i < library.Suites.Count; i++)
             {
                 FirmwareSuite suite = library.Suites[i];
                 SuiteItem item = new SuiteItem(suite);
                 suiteChoice.Items.Add(item);
                 if (suite.Usable && usableIndex < 0) usableIndex = i;
+                // 默认优先选 r11（锁存已关闭的当前版本），但不能因此把不可用套装选中。
+                if (suite.Usable && preferredIndex < 0 &&
+                    suite.Version.IndexOf("r11", StringComparison.OrdinalIgnoreCase) >= 0)
+                    preferredIndex = i;
             }
+            if (preferredIndex >= 0) usableIndex = preferredIndex;
             if (usableIndex >= 0) suiteChoice.SelectedIndex = usableIndex;
             else suiteChoice.SelectedIndex = 0;
             OnSuiteChanged();
@@ -375,7 +871,7 @@ namespace BoatTool
             public override string ToString()
             {
                 // 下拉里只放“转速 / 角度 + 版本”，完整 FWID 与清单摘要在右侧信息区。
-                if (Suite.Usable) return Suite.DisplayName + "（版本 " + Suite.Version + "）";
+                if (Suite.Usable) return Suite.DisplayName + "（" + Suite.LockoutText + "，版本 " + Suite.Version + "）";
                 return Suite.Id + "（不可用）";
             }
         }
@@ -625,6 +1121,57 @@ namespace BoatTool
             finally { SetBusy(false, null); }
         }
 
+        // 只读核验：不写配置，用于解除“已保存但未确认生效”等状态。
+        private void RunVerify()
+        {
+            if (busy) return;
+            PortScan scan = SelectedScan();
+            if (scan == null) { SetStatus("请先选择要核验的那块板子的串口", true); return; }
+            BoardRole role = scan.RememberedRole != BoardRole.Unknown ? scan.RememberedRole : ChosenRole();
+            if (role == BoardRole.Unknown)
+            {
+                SetStatus("请先选择这块板是小船还是遥控器", true);
+                return;
+            }
+            // 期望对端：优先取另一个已扫描到、角色互补的板子；否则用该端当前对端地址。
+            string peer = "";
+            foreach (PortScan other in scans.Values)
+            {
+                if (other == scan || !other.Responded) continue;
+                if (role == BoardRole.Boat && other.Identity.Role == BoardRole.Remote) peer = other.Identity.Mac;
+                if (role == BoardRole.Remote && other.Identity.Role == BoardRole.Boat) peer = other.Identity.Mac;
+                if (peer.Length > 0) break;
+            }
+            if (peer.Length == 0 && scan.Responded) peer = scan.Identity.Peer;
+            if (string.IsNullOrEmpty(peer) || peer == "00:00:00:00:00:00")
+            {
+                SetStatus("没有可用的期望对端地址：请同时插上另一端，或先完成一次配对", true);
+                return;
+            }
+            string question = "只读核验（不会写入任何配置）：" + Environment.NewLine + Environment.NewLine +
+                              "串口：" + scan.Port.Name + Environment.NewLine +
+                              "角色：" + RoleNames.Chinese(role) + Environment.NewLine +
+                              "期望本机 MAC：" + scan.MacText + Environment.NewLine +
+                              "期望对端 MAC：" + peer + Environment.NewLine + Environment.NewLine +
+                              "如果板子刚写入过配对，请先断开动力、重新上电再做核验。";
+            if (MessageBox.Show(this, question, "确认只读核验", MessageBoxButtons.OKCancel,
+                    MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) != DialogResult.OK) return;
+
+            SetBusy(true, "正在只读核验……（不写入配置）");
+            try
+            {
+                OperationResult result = workflow.VerifyOnly(scan, role, peer);
+                ShowResult(result);
+                RefreshPorts();
+            }
+            catch (Exception ex)
+            {
+                AppendLog("只读核验异常：" + ex.Message);
+                SetStatus("只读核验异常：" + ex.Message, true);
+            }
+            finally { SetBusy(false, null); }
+        }
+
         private void RunPair()
         {
             if (busy) return;
@@ -659,6 +1206,8 @@ namespace BoatTool
             finally { SetBusy(false, null); }
         }
 
+        // 汇总只认 result.Ok。部分完成、超时、待核验一律走警告分支，
+        // 不会因为文案里出现“已保存”等字样就被显示成绿色完成。
         private void ShowResult(OperationResult result)
         {
             if (result == null) return;
@@ -666,6 +1215,14 @@ namespace BoatTool
             if (!string.IsNullOrEmpty(result.Summary)) AppendLog(result.Summary);
             if (!result.Ok && !string.IsNullOrEmpty(result.Error)) AppendLog("未完成：" + result.Error);
 
+            if (result.Ok && result.Partial)
+            {
+                // 防御：状态自相矛盾时按未完成处理，绝不显示绿色。
+                SetStatus(FirstLine(result.Summary), true);
+                MessageBox.Show(this, result.Summary, "部分完成，需要重试",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
             if (result.Ok)
             {
                 SetStatus(FirstLine(result.Summary), false);
@@ -740,6 +1297,7 @@ namespace BoatTool
             refreshButton.Enabled = !value;
             suiteChoice.Enabled = !value;
             backupButton.Enabled = !value;
+            verifyButton.Enabled = !value && library.Suites.Count > 0;
             boatPortChoice.Enabled = !value;
             remotePortChoice.Enabled = !value;
             backupBeforeFlash.Enabled = !value;
@@ -819,6 +1377,12 @@ namespace BoatTool
             {
                 text.AppendLine("【跨套装提示】");
                 text.AppendLine(plan.CrossSuiteWarning);
+                text.AppendLine();
+            }
+            if (!string.IsNullOrEmpty(plan.LockoutChangeText))
+            {
+                text.AppendLine("【超速锁存】");
+                text.AppendLine(plan.LockoutChangeText);
                 text.AppendLine();
             }
             if (plan.Downgrade)

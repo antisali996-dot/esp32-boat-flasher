@@ -242,13 +242,42 @@ namespace BoatTool
             return result;
         }
 
-        public PairWriteResult WritePair(string port, string peerMac, BoardIdentity expected, Logger log)
+        // 串口通道：把 SerialPort 包成字节流，供状态机使用（测试注入模拟字节）。
+        private sealed class SerialPairChannel : IPairChannel
+        {
+            private readonly SerialPort serial;
+            public SerialPairChannel(SerialPort serial) { this.serial = serial; }
+            public void Write(string text) { serial.Write(text); }
+            public int Read(byte[] buffer, int offset, int count)
+            {
+                try { return serial.Read(buffer, offset, count); }
+                catch (TimeoutException) { return 0; }
+            }
+            public void DiscardInput()
+            {
+                try { serial.DiscardInBuffer(); }
+                catch { }
+            }
+        }
+
+        public PairWriteResult WritePair(string port, string peerMac, BoardIdentity expected, string expectedFwid,
+                                         Logger log)
         {
             PairWriteResult result = new PairWriteResult();
+            result.State = PairLinkState.NotStarted;
             string peer = MacText.NormalizePeer(peerMac);
             if (peer.Length == 0 || peer == "00:00:00:00:00:00")
             {
                 result.Error = "配对地址无效";
+                result.State = PairLinkState.FailedNeedsPowerCycle;
+                result.Message = result.Error;
+                return result;
+            }
+            if (expected == null || string.IsNullOrEmpty(expected.Mac))
+            {
+                result.Error = "缺少写入前核对过的本机身份";
+                result.State = PairLinkState.FailedNeedsPowerCycle;
+                result.Message = result.Error;
                 return result;
             }
 
@@ -258,7 +287,7 @@ namespace BoatTool
                 serial = new SerialPort(port, 115200, Parity.None, 8, StopBits.One);
                 serial.DtrEnable = false;
                 serial.RtsEnable = false;
-                serial.ReadTimeout = 250;
+                serial.ReadTimeout = 100;
                 serial.WriteTimeout = 500;
                 serial.NewLine = "\n";
                 serial.Open();
@@ -268,97 +297,92 @@ namespace BoatTool
                 BoardIdentity before = QueryIdentity(serial, 5000);
                 if (before == null)
                 {
-                    result.Error = "写入配对前没有读到板子身份，已停止";
+                    result.Error = "写入配对前没有读到板子身份，已停止，没有发送绑定";
+                    result.State = PairLinkState.FailedNeedsPowerCycle;
+                    result.Message = result.Error;
                     return result;
                 }
                 if (!SameIdentity(before, expected))
                 {
                     result.Error = "写入配对前核对失败：当前板子与选定时不一致（" + Describe(before) +
-                                   "，选定时为 " + Describe(expected) + "），已停止";
-                    return result;
-                }
-                if (before.Mac == peer)
-                {
-                    result.Error = "对端地址与本机相同，已停止";
+                                   "，选定时为 " + Describe(expected) + "），已停止，没有发送绑定";
+                    result.State = PairLinkState.FailedNeedsPowerCycle;
+                    result.Message = result.Error;
                     return result;
                 }
 
-                serial.DiscardInBuffer();
-                serial.WriteLine("JAY BIND " + peer);
-                bool ack = false;
-                bool rebooted = false;
-                DateTime deadline = DateTime.UtcNow.AddMilliseconds(6000);
-                while (DateTime.UtcNow < deadline)
-                {
-                    try
-                    {
-                        string line = serial.ReadLine();
-                        if (string.IsNullOrEmpty(line)) continue;
-                        if (line.IndexOf("JAY SAVED REBOOT", StringComparison.Ordinal) >= 0)
-                        {
-                            ack = true;
-                            rebooted = true;
-                            break;
-                        }
-                        if (line.IndexOf("JAY ERROR=", StringComparison.Ordinal) >= 0)
-                        {
-                            result.Error = "板子拒绝保存配对：" + line.Trim();
-                            return result;
-                        }
-                    }
-                    catch (TimeoutException) { }
-                }
-                if (!ack)
-                {
-                    result.Error = "没有收到配对保存回应，不能认为配对成功（板上程序可能过旧）";
-                    return result;
-                }
-                result.Saved = true;
-
-                // 等待重启完成，再读回核验。
-                clock.Sleep(1200);
-                BoardIdentity after = null;
-                DateTime readUntil = DateTime.UtcNow.AddMilliseconds(8000);
-                while (DateTime.UtcNow < readUntil)
-                {
-                    after = QueryIdentity(serial, 1500);
-                    if (after != null) break;
-                    clock.Sleep(300);
-                }
-                result.After = after;
-                if (after == null)
-                {
-                    result.Error = "已保存并重启，但没有读到重启后的身份，未完成读回核验";
-                    return result;
-                }
-                if (after.Mac != before.Mac)
-                {
-                    result.Error = "重启后读到的芯片 MAC 变化（" + before.Mac + " → " + after.Mac + "），未通过核验";
-                    return result;
-                }
-                if (after.Role != before.Role)
-                {
-                    result.Error = "重启后角色变化（" + before.RoleText + " → " + after.RoleText + "），未通过核验";
-                    return result;
-                }
-                if (after.Peer != peer)
-                {
-                    result.Error = "重启后读回的配对地址是 " + after.PeerText + "，不是 " + peer + "，未通过核验";
-                    return result;
-                }
-                result.Ok = true;
-                result.Rebooted = rebooted;
-                result.ReadBackVerified = true;
+                PairingSession session = new PairingSession(new SerialPairChannel(serial), clock,
+                    delegate(string text) { if (log != null) log.Info("配对：" + text); });
+                // 板上会在保存后重启；给一段重启等待再开始核验。
+                PairOutcome outcome = session.BindAndVerify(before, expected.Role, peer, expectedFwid,
+                    6000, 9000, 1500);
+                result.State = outcome.State;
+                result.Message = outcome.Message;
+                result.After = outcome.FinalIdentity;
+                result.BindCommandsSent = outcome.BindCommandsSent;
+                result.Events = outcome.Events;
+                result.Saved = outcome.AckSeen;
+                result.Rebooted = outcome.AckSeen;
+                result.ReadBackVerified = outcome.State == PairLinkState.LocalVerified;
+                result.Ok = outcome.Ok;
+                if (!outcome.Ok && string.IsNullOrEmpty(result.Error)) result.Error = outcome.Message;
                 return result;
             }
             catch (UnauthorizedAccessException)
             {
                 result.Error = "串口被其他程序占用，请关闭后重试";
+                result.State = PairLinkState.FailedNeedsPowerCycle;
+                result.Message = result.Error;
                 return result;
             }
             catch (Exception ex)
             {
                 result.Error = "配对写入异常：" + ex.Message;
+                result.State = PairLinkState.TimeoutUnknown;
+                result.Message = "配对过程中出现异常，结果未知：" + ex.Message;
+                return result;
+            }
+            finally
+            {
+                if (serial != null)
+                {
+                    try { if (serial.IsOpen) serial.Close(); }
+                    catch { }
+                    serial.Dispose();
+                }
+            }
+        }
+
+        public VerifyResult VerifyPairing(string port, BoardRole role, string expectedMac, string expectedPeer,
+                                          string expectedFwid, Logger log)
+        {
+            VerifyResult result = new VerifyResult();
+            SerialPort serial = null;
+            try
+            {
+                serial = new SerialPort(port, 115200, Parity.None, 8, StopBits.One);
+                serial.DtrEnable = false;
+                serial.RtsEnable = false;
+                serial.ReadTimeout = 100;
+                serial.WriteTimeout = 500;
+                serial.NewLine = "\n";
+                serial.Open();
+                clock.Sleep(300);
+                VerifySession session = new VerifySession(new SerialPairChannel(serial), clock,
+                    delegate(string text) { if (log != null) log.Info("只读核验：" + text); });
+                PairOutcome outcome = session.Verify(role, expectedMac, expectedPeer, expectedFwid, 6000);
+                result.State = outcome.State;
+                result.Message = outcome.Message;
+                result.Identity = outcome.FinalIdentity;
+                result.InfoCommandsSent = outcome.InfoCommandsSent;
+                result.Events = outcome.Events;
+                result.Ok = outcome.Ok;
+                return result;
+            }
+            catch (Exception ex)
+            {
+                result.State = PairLinkState.TimeoutUnknown;
+                result.Message = "只读核验出现异常：" + ex.Message;
                 return result;
             }
             finally

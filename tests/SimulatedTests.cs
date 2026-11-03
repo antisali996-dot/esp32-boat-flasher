@@ -63,6 +63,8 @@ namespace BoatTool
                 TestFlashKeepsNvsWording();
                 TestIncompatiblePartitionRefused();
                 TestMissingEsptoolMarksSuiteUnusable();
+                TestPairRejectsUnknownFwid();
+                TestPresetBlocksWrongChip();
             }
             finally
             {
@@ -1191,6 +1193,108 @@ namespace BoatTool
             File.WriteAllBytes(spec.BootloaderPath, new byte[0x9000]);
             bad = PartitionLayout.Analyze(spec.PartitionsPath, spec.AppOffset, new FileInfo(spec.AppPath).Length, spec);
             Check("过长启动镜像触及NVS被拦截", bad.Error.Contains("NVS"), bad.Error);
+        }
+
+        // 绑定不改 FWID：但必须拒绝固件库里完全没有、或转向契约不同的固件。
+        private static void TestPairRejectsUnknownFwid()
+        {
+            Console.WriteLine("32. 配对拒绝未知固件 / 契约不符固件");
+            SimulatedTransport transport = new SimulatedTransport();
+            SimBoard boat = NewBoard(BoatMac, BoardRole.Boat, "JAYFWB9-S20-A70-110-U1278-1500-1722-R999-Cunknown");
+            SimBoard remote = NewBoard(RemoteMac, BoardRole.Remote, Fwid580Remote);
+            transport.Boards.Add(boat);
+            transport.Boards.Add(remote);
+            transport.Plug("COM8", BoatMac);
+            transport.Plug("COM9", RemoteMac);
+            Workflow flow = MakeWorkflow(transport, new SimUi(),
+                new RoleStore(Path.Combine(workRoot, "unknownfw-" + Guid.NewGuid().ToString("N") + ".json")));
+            List<PortScan> scans = flow.Scan();
+            OperationResult r = flow.PairTwoBoards(scans.Find(s => s.Port.Name == "COM8"),
+                                                  scans.Find(s => s.Port.Name == "COM9"));
+            Check("未知固件拒绝配对", !r.Ok && transport.WritePairCount == 0, "未知固件仍被配对");
+            Check("拒绝原因提到固件库或契约",
+                r.Error.Contains("固件库") || r.Error.Contains("转向契约"), r.Error);
+
+            // 跨套装（590 小船 + 580 遥控器，都是 20° 契约）允许，且绑定不改写 FWID。
+            SimulatedTransport t2 = new SimulatedTransport();
+            SimBoard b2 = NewBoard(BoatMac, BoardRole.Boat, Fwid590Boat);
+            SimBoard r2 = NewBoard(RemoteMac, BoardRole.Remote, Fwid580Remote);
+            t2.Boards.Add(b2);
+            t2.Boards.Add(r2);
+            t2.Plug("COM8", BoatMac);
+            t2.Plug("COM9", RemoteMac);
+            Workflow wf2 = MakeWorkflow(t2, new SimUi(),
+                new RoleStore(Path.Combine(workRoot, "crossfw-" + Guid.NewGuid().ToString("N") + ".json")));
+            List<PortScan> s2 = wf2.Scan();
+            OperationResult ok = wf2.PairTwoBoards(s2.Find(s => s.Port.Name == "COM8"),
+                                                  s2.Find(s => s.Port.Name == "COM9"));
+            Check("跨套装同契约允许配对", ok.Ok, "跨套装被拒绝：" + ok.Error);
+            Check("绑定不改写固件身份", b2.Fwid == Fwid590Boat && r2.Fwid == Fwid580Remote, "FWID 被改写");
+            Console.WriteLine();
+        }
+
+        // 分类包预设：地址不符必须拒绝写入与绑定。
+        private static void TestPresetBlocksWrongChip()
+        {
+            Console.WriteLine("33. 分类包预设按芯片地址拦截");
+            string dir = Path.Combine(workRoot, "preset-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(dir);
+            string presetPath = Path.Combine(dir, "preset.json");
+            File.WriteAllText(presetPath,
+                "{ \"id\": \"old-boat\", \"kind\": \"category\", \"title\": \"旧小船分类包\", " +
+                "\"suite_id\": \"580-20-r3\", " +
+                "\"boat_mac\": \"" + OldBoatMac + "\", " +
+                "\"remote_mac\": \"" + RemoteMac + "\", " +
+                "\"boat_fwid\": \"" + Fwid580Boat + "\", " +
+                "\"remote_fwid\": \"" + Fwid580Remote + "\" }", new UTF8Encoding(false));
+            PresetConfig preset = PresetConfig.Load(presetPath);
+            Check("预设解析成功", preset.Problems.Count == 0 && preset.IsCategory,
+                string.Join("；", preset.Problems.ToArray()));
+            Check("预设描述含两个 MAC", preset.Describe().Contains(OldBoatMac) &&
+                  preset.Describe().Contains(RemoteMac), preset.Describe());
+
+            // 新小船（F1:36:64）不属于本分类包 → 拒绝烧录与绑定。
+            SimulatedTransport transport = new SimulatedTransport();
+            SimBoard wrongBoat = NewBoard(BoatMac, BoardRole.Boat, "");
+            SimBoard remote = NewBoard(RemoteMac, BoardRole.Remote, Fwid580Remote);
+            transport.Boards.Add(wrongBoat);
+            transport.Boards.Add(remote);
+            transport.Plug("COM8", BoatMac);
+            transport.Plug("COM9", RemoteMac);
+            Workflow flow = MakeWorkflow(transport, new SimUi(),
+                new RoleStore(Path.Combine(workRoot, "preset-store-" + Guid.NewGuid().ToString("N") + ".json")),
+                null, "580-20-r3");
+            flow.Preset = preset;
+
+            PortScan scan = flow.Scan().Find(x => x.Port.Name == "COM8");
+            OperationResult flash = flow.FlashCurrent(scan, BoardRole.Boat, false, false);
+            Check("地址不符拒绝烧录", !flash.Ok && transport.WriteFirmwareCount == 0, "地址不符仍烧录");
+            Check("拒绝原因提到分类包", flash.Error.Contains("分类包"), flash.Error);
+
+            List<PortScan> scans = flow.Scan();
+            OperationResult pair = flow.PairTwoBoards(scans.Find(x => x.Port.Name == "COM8"),
+                                                     scans.Find(x => x.Port.Name == "COM9"));
+            Check("地址不符拒绝配对", !pair.Ok && transport.WritePairCount == 0, "地址不符仍绑定");
+
+            // 正确的旧小船 → 允许。
+            SimulatedTransport t2 = new SimulatedTransport();
+            SimBoard okBoat = NewBoard(OldBoatMac, BoardRole.Boat, "");
+            SimBoard okRemote = NewBoard(RemoteMac, BoardRole.Remote, Fwid580Remote);
+            t2.Boards.Add(okBoat);
+            t2.Boards.Add(okRemote);
+            t2.Plug("COM8", OldBoatMac);
+            t2.Plug("COM9", RemoteMac);
+            Workflow wf2 = MakeWorkflow(t2, new SimUi(),
+                new RoleStore(Path.Combine(workRoot, "preset-store2-" + Guid.NewGuid().ToString("N") + ".json")),
+                null, "580-20-r3");
+            wf2.Preset = preset;
+            List<PortScan> s2 = wf2.Scan();
+            OperationResult okFlash = wf2.FlashCurrent(s2.Find(x => x.Port.Name == "COM8"), BoardRole.Boat, false, false);
+            Check("地址相符允许烧录", okFlash.Ok, "地址相符却被拒绝：" + okFlash.Error);
+            OperationResult okPair = wf2.PairTwoBoards(wf2.Scan().Find(x => x.Port.Name == "COM8"),
+                                                      wf2.Scan().Find(x => x.Port.Name == "COM9"));
+            Check("地址相符允许配对", okPair.Ok, "地址相符却配对失败：" + okPair.Error);
+            Console.WriteLine();
         }
 
         private static string BuildManifest(string boatFwid, string remoteFwid)

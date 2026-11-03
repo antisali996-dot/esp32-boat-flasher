@@ -14,6 +14,8 @@ namespace BoatTool
         public string Version = "";
         public int TargetRpm = -1;
         public int SteerDeg = -1;
+        // 该套装的超速锁存状态（以 FWID 为准，见 FirmwareCatalog.SelfCheck）。
+        public OverspeedLockout Lockout = OverspeedLockout.Unknown;
         public string CatalogDir = "";
         public string EsptoolPath = "";
         public FirmwareCatalog Catalog;
@@ -33,12 +35,24 @@ namespace BoatTool
             get { return SteerDeg > 0 ? "左右各 " + SteerDeg + "°" : "角度未知"; }
         }
 
+        public string LockoutText
+        {
+            get { return OverspeedLockoutText.Chinese(Lockout); }
+        }
+
+        // 下拉与说明里使用：明确区分“锁存开启 / 已关闭 / 未声明”。
+        public string DisplayNameWithLockout
+        {
+            get { return DisplayName + " / " + LockoutText; }
+        }
+
         // 下拉框里显示的一行文字：以清单为准，不用文件名。
         public string Display
         {
             get
             {
-                return DisplayName + "（" + SpeedText + " / " + SteerText + "，版本 " + Version + "）";
+                return DisplayName + "（" + SpeedText + " / " + SteerText + "，" + LockoutText +
+                       "，版本 " + Version + "）";
             }
         }
 
@@ -103,6 +117,9 @@ namespace BoatTool
             suite.Version = suite.Catalog.Version;
             suite.TargetRpm = suite.Catalog.TargetRpm;
             suite.SteerDeg = suite.Catalog.SteerDeg;
+            suite.Lockout = suite.Catalog.ForRole(BoardRole.Boat) == null
+                ? OverspeedLockout.Unknown
+                : suite.Catalog.ForRole(BoardRole.Boat).Lockout;
             suite.DisplayName = BuildDisplayName(suite);
 
             if (!File.Exists(suite.EsptoolPath))

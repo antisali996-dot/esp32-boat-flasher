@@ -53,12 +53,30 @@ namespace BoatTool
 
     public class PairWriteResult
     {
+        // Ok 只在“本端配置已核对”时为 true；JAY SAVED REBOOT 只记录在 Saved 里。
         public bool Ok;
         public bool Saved;
         public bool Rebooted;
         public bool ReadBackVerified;
         public string Error = "";
         public BoardIdentity After;
+        // 状态机的最终状态与过程记录，供界面和中日文案使用。
+        public PairLinkState State = PairLinkState.NotStarted;
+        public string Message = "";
+        public int BindCommandsSent;
+        public List<string> Events = new List<string>();
+        public bool NeedsPowerCycle { get { return PairLinkText.NeedsPowerCycleVerify(State); } }
+    }
+
+    // 只读核验结果：不写配置，只读身份并核对。
+    public class VerifyResult
+    {
+        public bool Ok;
+        public PairLinkState State = PairLinkState.NotStarted;
+        public string Message = "";
+        public BoardIdentity Identity;
+        public int InfoCommandsSent;
+        public List<string> Events = new List<string>();
     }
 
     // 硬件接口：真实实现走串口+esptool；测试用模拟实现，绝不触碰真实设备。
@@ -78,7 +96,13 @@ namespace BoatTool
         FlashResult WriteFirmware(string port, string esptoolPath, FirmwareSpec spec, bool verify,
                                   string logDir, Logger log);
 
-        PairWriteResult WritePair(string port, string peerMac, BoardIdentity expected, Logger log);
+        // 绑定并按第三节规则核验；expectedFwid 必须是本轮编译清单里该角色的 FWID。
+        PairWriteResult WritePair(string port, string peerMac, BoardIdentity expected, string expectedFwid,
+                                  Logger log);
+
+        // 只读核验（解除“已保存但未确认生效”的唯一途径）。
+        VerifyResult VerifyPairing(string port, BoardRole role, string expectedMac, string expectedPeer,
+                                   string expectedFwid, Logger log);
     }
 
     public interface IClock

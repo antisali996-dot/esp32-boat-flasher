@@ -101,6 +101,10 @@ namespace BoatTool
         public bool Downgrade;             // 目标转速低于板上
         public string CrossSuiteWarning = "";
         public string NvsNote = "";
+        // 超速锁存：板上与将写入两侧都明确展示（开启/关闭/未声明）。
+        public OverspeedLockout BoardLockout = OverspeedLockout.Unknown;
+        public OverspeedLockout TargetLockout = OverspeedLockout.Unknown;
+        public string LockoutChangeText = "";
         public bool ExplicitReflash;       // 用户明确选择重刷
     }
 
@@ -133,6 +137,10 @@ namespace BoatTool
         private bool safetyAcknowledged;
         private FirmwareSuite selectedSuite;
         private bool allowDowngrade;
+        // 分类包预设：为空表示通用包（允许任意芯片，但仍按 MAC 核对）。
+        private PresetConfig preset;
+        // 诊断占用：记录期间这些串口不允许被烧录/配对/扫描重新打开。
+        private IPortLockRegistry portLocks;
 
         public Workflow(AppPaths paths, FirmwareLibrary library, RoleStore roles,
                         IBoardTransport transport, IClock clock, IUserInteraction ui)
@@ -147,6 +155,38 @@ namespace BoatTool
         }
 
         public bool SafetyAcknowledged { get { return safetyAcknowledged; } set { safetyAcknowledged = value; } }
+
+        // 分类包预设：设置后，写入与绑定都会先核对实际芯片地址。
+        public PresetConfig Preset
+        {
+            get { return preset; }
+            set { preset = value; }
+        }
+
+        public IPortLockRegistry PortLocks
+        {
+            get { return portLocks; }
+            set { portLocks = value; }
+        }
+
+        // 核心层拒绝：界面禁用只是保护之一。
+        private bool RejectIfLocked(string port, OperationResult result)
+        {
+            if (portLocks == null || !portLocks.IsLocked(port)) return false;
+            result.Error = "串口 " + port + " 正在被现场诊断占用（记录中），不能烧录、配对或重新扫描。" +
+                           "请先停止诊断记录后再操作。";
+            return true;
+        }
+
+        // 芯片地址必须符合分类包预设；不设置预设（通用包）时一律允许。
+        private bool PresetAllows(BoardRole role, string mac, OperationResult result)
+        {
+            if (preset == null || !preset.IsCategory) return true;
+            string reason;
+            bool ok = role == BoardRole.Boat ? preset.AllowsBoat(mac, out reason) : preset.AllowsRemote(mac, out reason);
+            if (!ok) result.Error = "本分类包不允许操作这块板：" + reason;
+            return ok;
+        }
 
         // 当前选中的固件套装；为空表示没有可用套装，所有写入操作都必须拒绝。
         public FirmwareSuite SelectedSuite
@@ -193,6 +233,14 @@ namespace BoatTool
             {
                 PortScan scan = new PortScan();
                 scan.Port = port;
+                // 诊断记录中的串口不能被扫描/探测重新打开。
+                if (portLocks != null && portLocks.IsLocked(port.Name))
+                {
+                    scan.Note = "现场诊断记录中，已跳过探测";
+                    scan.ProbeError = "locked-by-diagnostics";
+                    results.Add(scan);
+                    continue;
+                }
                 ProbeResult probe = transport.Probe(port.Name, 3000);
                 if (probe.Ok)
                 {
@@ -310,6 +358,8 @@ namespace BoatTool
         public OperationResult FlashCurrent(PortScan scan, BoardRole chosenRole, bool doBackup, bool forceReflash)
         {
             OperationResult result = new OperationResult();
+            // 诊断占用必须最先拒绝：即使没有套餐也不归还控制权给写入路径。
+            if (scan != null && scan.Port != null && RejectIfLocked(scan.Port.Name, result)) return result;
             FirmwareSuite suite = selectedSuite;
             if (suite == null)
             {
@@ -325,6 +375,7 @@ namespace BoatTool
             if (!AcknowledgeSafety()) { result.Error = "已取消：尚未断开动力电池"; return result; }
 
             string port = scan.Port.Name;
+            if (RejectIfLocked(port, result)) return result;
             string esptool = suite.EsptoolPath;
             ProbeResult probe = transport.Probe(port, 5000);
             BoardIdentity identity;
@@ -349,6 +400,8 @@ namespace BoatTool
                     result.Error = "没有确定这块板要用作小船还是遥控器。";
                 return result;
             }
+
+            if (!PresetAllows(role, identity.Mac, result)) return result;
 
             if (identity.Role != BoardRole.Unknown && identity.Role != role)
             {
@@ -426,6 +479,29 @@ namespace BoatTool
                 plan.Downgrade = true;
                 plan.CrossSuiteWarning += Environment.NewLine +
                     "注意：这是降级——板上目标 " + boardInfo.TargetRpm + " 转，将写入 " + suite.TargetRpm + " 转。";
+            }
+
+            // 超速锁存：即使目标转速都为 590，也要明确展示保护差异。
+            plan.BoardLockout = OverspeedLockoutText.FromFwid(identity.FirmwareId);
+            plan.TargetLockout = spec.Lockout;
+            string boardLock = OverspeedLockoutText.Chinese(plan.BoardLockout);
+            string targetLock = OverspeedLockoutText.Chinese(plan.TargetLockout);
+            if (plan.BoardLockout != plan.TargetLockout)
+            {
+                plan.LockoutChangeText = "超速锁存变化：板上【" + boardLock + "】→ 将写入【" + targetLock + "】。" +
+                    (plan.TargetLockout == OverspeedLockout.Disabled
+                        ? "写入后 600 不再触发停机；这不保证空载转速低于 600，也没有电流反馈保证不过载。"
+                        : (plan.TargetLockout == OverspeedLockout.Enabled
+                            ? "写入后 600 会触发软件锁存停机；这只是软件阈值，不是物理转速上限的保证。"
+                            : "目标固件没有声明锁存状态，不能假定开启或关闭。"));
+            }
+            else
+            {
+                plan.LockoutChangeText = "超速锁存：本端与目标均为【" + targetLock + "】。";
+                if (plan.TargetLockout == OverspeedLockout.Disabled)
+                    plan.LockoutChangeText += "600 不触发停机；不保证空载转速低于 600，也没有电流反馈保证不过载。";
+                else if (plan.TargetLockout == OverspeedLockout.Enabled)
+                    plan.LockoutChangeText += "600 会触发软件锁存停机；这不代表物理转速上限已被证明。";
             }
 
             plan.NvsNote = "写入 " + spec.DescribeImages() + "；分区表校验通过：" + layout.DescribeNvs();
@@ -618,6 +694,49 @@ namespace BoatTool
             return id;
         }
 
+        // 只读核验：解除“已保存但未确认生效 / 失败需重新上电”状态的唯一途径。
+        // 不写任何配置，只发 JAY INFO 并严格核对。
+        public OperationResult VerifyOnly(PortScan scan, BoardRole role, string expectedPeer)
+        {
+            OperationResult result = new OperationResult();
+            if (scan == null || scan.Port == null) { result.Error = "没有选择串口"; return result; }
+            if (!AcknowledgeSafety()) { result.Error = "已取消：尚未断开动力电池"; return result; }
+
+            string fwidProblem;
+            BoardIdentity before = scan.Identity;
+            string expectedFwid = ExpectedFwid(role, before, out fwidProblem);
+            if (expectedFwid == null)
+            {
+                result.Error = "不能做只读核验：该端" + fwidProblem;
+                return result;
+            }
+            if (before == null || string.IsNullOrEmpty(before.Mac))
+            {
+                result.Error = "没有可用的芯片 MAC，无法做只读核验；请先点“刷新列表”。";
+                return result;
+            }
+
+            result.RecordDir = paths.NewSession("只读核验-" + RoleNames.Chinese(role));
+            Logger log = new Logger(Path.Combine(result.RecordDir, "操作记录.txt"), ui.Report);
+            log.Info("只读核验：串口 " + scan.Port.Name + "，角色 " + RoleNames.Chinese(role) +
+                     "，期望本机 " + before.Mac + "，期望对端 " + expectedPeer);
+
+            VerifyResult vr = transport.VerifyPairing(scan.Port.Name, role, before.Mac, expectedPeer, expectedFwid, log);
+            if (vr.Events != null) foreach (string e in vr.Events) result.Step(e);
+            if (vr.Ok)
+            {
+                result.Ok = true;
+                result.Summary = "只读核验通过：本端配对配置与本次目标一致（角色 " + RoleNames.Chinese(role) +
+                                 "，本机 " + vr.Identity.Mac + "，对端 " + vr.Identity.Peer +
+                                 "，固件身份与本轮清单一致）。本次没有写入任何配置。";
+                roles.Remember(vr.Identity.Mac, role, scan.Port.Name, "只读核验通过");
+                return result;
+            }
+            result.Error = vr.Message;
+            result.Summary = "只读核验未通过：" + vr.Message + " 没有写入任何配置。";
+            return result;
+        }
+
         public OperationResult BackupOnly(PortScan scan)
         {
             OperationResult result = new OperationResult();
@@ -718,6 +837,7 @@ namespace BoatTool
                 result.Error = "小船和遥控器不能选择同一个串口（" + boatPort + "）";
                 return result;
             }
+            if (RejectIfLocked(boatPort, result) || RejectIfLocked(remotePort, result)) return result;
             if (!AcknowledgeSafety()) { result.Error = "已取消：尚未断开动力电池"; return result; }
 
             string esptool = EsptoolOf(selectedSuite);
@@ -743,6 +863,8 @@ namespace BoatTool
                 result.Error = "遥控器串口 " + remotePort + " 读到的角色是" + remote.RoleText + "（MAC " + remote.Mac + "），请调换串口选择。";
                 return result;
             }
+            if (!PresetAllows(BoardRole.Boat, boat.Mac, result)) return result;
+            if (!PresetAllows(BoardRole.Remote, remote.Mac, result)) return result;
             // 记忆中的角色若与板上角色冲突，说明换插或曾刷错固件，必须人工确认，不能继续自动写入。
             BoardRole boatRemembered = roles.RoleOf(boat.Mac);
             BoardRole remoteRemembered = roles.RoleOf(remote.Mac);
@@ -814,51 +936,62 @@ namespace BoatTool
             int done = 0;
             bool boatDone = boatAlready;
             bool remoteDone = remoteAlready;
-            string boatError = "";
-            string remoteError = "";
+            // 每端保留状态机结论：只有 LocalVerified 才算完成。
+            PairOutcome boatOutcome = boatAlready
+                ? PairOutcome.Skipped(PairLinkState.LocalVerified, "对端已正确，跳过绑定") : null;
+            PairOutcome remoteOutcome = remoteAlready
+                ? PairOutcome.Skipped(PairLinkState.LocalVerified, "对端已正确，跳过绑定") : null;
+
+            string fwidProblem;
+            string boatFwid = ExpectedFwid(BoardRole.Boat, boat, out fwidProblem);
+            if (boatFwid == null) { result.Error = "不能配对：小船" + fwidProblem; return result; }
+            string remoteFwid = ExpectedFwid(BoardRole.Remote, remote, out fwidProblem);
+            if (remoteFwid == null) { result.Error = "不能配对：遥控器" + fwidProblem; return result; }
 
             if (!boatAlready)
             {
-                PairWriteResult boatWrite = transport.WritePair(boatPort, remote.Mac, boat, log);
+                PairWriteResult boatWrite = transport.WritePair(boatPort, remote.Mac, boat, boatFwid, log);
+                boatOutcome = PairOutcome.From(boatWrite);
+                RecordEvents(result, "小船", boatWrite.Events);
                 if (boatWrite.Ok)
                 {
                     done++;
                     boatDone = true;
-                    result.Step("小船：已保存并重启读回，对端 " + remote.Mac + "（本机 " + boat.Mac + "）");
+                    result.Step("小船：本端配置已核对，对端 " + remote.Mac + "（本机 " + boat.Mac + "）");
                     roles.Remember(boat.Mac, BoardRole.Boat, boatPort, "配对 " + remote.Mac);
-                    log.Info("小船配对完成并通过读回核验");
+                    log.Info("小船配对配置已核对");
                 }
                 else
                 {
-                    boatError = boatWrite.Error;
-                    log.Info("小船配对失败：" + boatError);
+                    log.Info("小船未完成：" + boatWrite.Message);
                 }
             }
             else
             {
-                result.Step("小船：对端已经是 " + remote.Mac + "，跳过写入与重启");
+                result.Step("小船：对端已经是 " + remote.Mac + "，跳过绑定与重启");
             }
 
             if (!remoteAlready)
             {
-                PairWriteResult remoteWrite = transport.WritePair(remotePort, boat.Mac, remote, log);
+                PairWriteResult remoteWrite = transport.WritePair(remotePort, boat.Mac, remote, remoteFwid, log);
+                remoteOutcome = PairOutcome.From(remoteWrite);
+                RecordEvents(result, "遥控器", remoteWrite.Events);
                 if (remoteWrite.Ok)
                 {
                     done++;
                     remoteDone = true;
-                    result.Step("遥控器：已保存并重启读回，对端 " + boat.Mac + "（本机 " + remote.Mac + "）");
+                    result.Step("遥控器：本端配置已核对，对端 " + boat.Mac + "（本机 " + remote.Mac + "）");
                     roles.Remember(remote.Mac, BoardRole.Remote, remotePort, "配对 " + boat.Mac);
-                    log.Info("遥控器配对完成并通过读回核验");
+                    log.Info("遥控器配对配置已核对");
                 }
                 else
                 {
-                    remoteError = remoteWrite.Error;
-                    log.Info("遥控器配对失败：" + remoteError);
+                    log.Info("遥控器未完成：" + remoteWrite.Message);
                 }
             }
             else
             {
-                result.Step("遥控器：对端已经是 " + boat.Mac + "，跳过写入与重启");
+                result.Step("遥控器：对端已经是 " + boat.Mac + "，跳过绑定与重启");
             }
 
             if (!boatDone || !remoteDone)
@@ -867,51 +1000,134 @@ namespace BoatTool
                 if (!boatDone) pending += "小船";
                 if (!remoteDone) pending += (pending.Length > 0 ? "、" : "") + "遥控器";
                 string detail = "";
-                if (!boatDone && boatError.Length > 0) detail += "小船失败原因：" + boatError + "\n";
-                if (!remoteDone && remoteError.Length > 0) detail += "遥控器失败原因：" + remoteError + "\n";
+                if (!boatDone) detail += "小船：" + PairLinkText.Chinese(boatOutcome.State) + " —— " + boatOutcome.Message + Environment.NewLine;
+                if (!remoteDone) detail += "遥控器：" + PairLinkText.Chinese(remoteOutcome.State) + " —— " + remoteOutcome.Message + Environment.NewLine;
                 result.Partial = true;
                 result.Error = "尚未完成：还需处理" + pending;
                 string progress = "已完成 " + done + "/" + needed;
                 if (boatAlready) progress += "，小船本来已正确";
                 if (remoteAlready) progress += "，遥控器本来已正确";
-                result.Summary = "部分完成（" + progress + "）：" + detail;
-                result.Summary += "两端现在可能暂时无法通信。排除连接问题后，再次点击“配对两块板”即可重试；" +
-                                  "重试只会处理尚未完成的一端，已正确的一端不会重写。";
+                result.Summary = "部分完成（" + progress + "）" + Environment.NewLine + detail;
+                bool needsPowerCycle = PairLinkText.NeedsPowerCycleVerify(boatOutcome.State) ||
+                                       PairLinkText.NeedsPowerCycleVerify(remoteOutcome.State);
+                if (needsPowerCycle)
+                {
+                    result.Summary += "未完成的一端处于“" +
+                                      (PairLinkText.NeedsPowerCycleVerify(boatOutcome.State)
+                                          ? PairLinkText.Chinese(boatOutcome.State)
+                                          : PairLinkText.Chinese(remoteOutcome.State)) +
+                                      "”。请断开动力、重新上电，再执行只读核验；不要把这里当作成功。" + Environment.NewLine;
+                }
+                result.Summary += "两端现在可能暂时无法通信。重试时先查询，不会盲目重发绑定；" +
+                                  "已正确的一端不会重写。";
                 return result;
             }
 
-            // 最终两端再读一次，确认 MAC、角色与对端地址。
+            // 最终两端再读一次，确认 MAC、角色、对端地址，以及本轮清单的 FWID。
             ProbeResult finalBoat = transport.Probe(boatPort, 5000);
             ProbeResult finalRemote = transport.Probe(remotePort, 5000);
             if (!finalBoat.Ok || !finalRemote.Ok)
             {
                 result.Partial = true;
                 result.Error = "两端写入均已完成，但最终复核时有板子没有回应。";
-                result.Summary = "部分完成：本次需要改的一端都已保存并读回，但最终复核失败（" +
+                result.Summary = "部分完成：本次需要改的一端都已核对，但最终复核失败（" +
                                  (finalBoat.Ok ? "" : "小船无回应；") + (finalRemote.Ok ? "" : "遥控器无回应；") +
                                  "）。请重新连接后点“刷新列表”核对，再视情况重试。";
                 return result;
             }
-            if (finalBoat.Identity.Peer != remote.Mac || finalRemote.Identity.Peer != boat.Mac ||
-                finalBoat.Identity.Mac != boat.Mac || finalRemote.Identity.Mac != remote.Mac)
+
+            string finalProblem = FinalCheck(finalBoat.Identity, remote.Mac, boatFwid, "小船") ??
+                                  FinalCheck(finalRemote.Identity, boat.Mac, remoteFwid, "遥控器");
+            if (finalProblem != null)
             {
                 result.Partial = true;
-                result.Error = "最终复核的对端地址与本次写入不一致。";
-                result.Summary = "部分完成：写入已保存，但最终复核不一致。小船对端 " + finalBoat.Identity.PeerText +
-                                 "，遥控器对端 " + finalRemote.Identity.PeerText + "。请重试配对。";
+                result.Error = "最终复核未通过：" + finalProblem;
+                result.Summary = "部分完成：写入已保存，但最终复核未通过（" + finalProblem +
+                                 "）。请断开动力重新上电后执行只读核验。";
                 return result;
             }
 
             result.Ok = true;
-            result.Summary = "配对完成：两端对端地址一致，重启与读回核验均已通过。";
+            result.Summary = "双端配对配置已核对。";
             result.Summary += Environment.NewLine + "小船 " + boat.Mac + " ←→ 遥控器 " + remote.Mac;
             if (boatAlready || remoteAlready)
                 result.Summary += Environment.NewLine + "本次跳过已正确的一端，只写了需要改的一端。";
             result.Summary += Environment.NewLine + "只修改了保存的对端地址，没有切换固件套装、没有重刷程序。";
             result.Summary += Environment.NewLine + "兼容性：" + compat;
             result.Summary += Environment.NewLine + "MAC 过滤不是加密认证，不能抵御刻意伪造 MAC。";
+            result.Summary += Environment.NewLine + "本结果只代表两端配对配置一致，不代表无线链路或舵机已验证。";
             result.Summary += Environment.NewLine + "记录目录：" + result.RecordDir;
             return result;
+        }
+
+        private static void RecordEvents(OperationResult result, string label, List<string> events)
+        {
+            if (events == null) return;
+            foreach (string e in events) result.Step(label + "过程：" + e);
+        }
+
+        // 绑定只改 PEER，不改 FWID。所以核验的不变量是“绑定前后 FWID 不变”，
+        // 而且该 FWID 必须是固件库里认识的、转向契约一致的固件。
+        // 这样：本轮 r7 包只含 r7，等于要求 r7；跨套装（590 小船 + 同一 20° 遥控器）
+        // 也不会被强制重刷——版本号不同不代表不能配对。
+        private string ExpectedFwid(BoardRole role, BoardIdentity current, out string problem)
+        {
+            problem = "";
+            if (current == null || !current.HasFirmwareId)
+            {
+                problem = "没有固件身份（FWID），无法确认协议与转向契约；请先升级。";
+                return null;
+            }
+            if (library == null || library.Suites.Count == 0)
+            {
+                problem = "固件库为空，无法确认该固件是否属于已知发布。";
+                return null;
+            }
+            FwidInfo actual = FwidInfo.Parse(current.FirmwareId);
+            if (!actual.Parsed)
+            {
+                problem = "固件身份无法解析（" + current.FirmwareId + "）。";
+                return null;
+            }
+            // 优先：与当前所选（或任一可用）套装完全一致 —— 本轮 r7 走这条。
+            foreach (FirmwareSuite suite in library.Suites)
+            {
+                if (!suite.Usable) continue;
+                FirmwareSpec spec = suite.SpecFor(role);
+                if (spec == null) continue;
+                if (string.Equals(spec.Fwid, current.FirmwareId, StringComparison.Ordinal))
+                    return spec.Fwid;
+            }
+            // 其次：该 FWID 本身必须出现在固件库某个可用套装里（跨套装允许，但必须是已知发布）。
+            // 不能只凭“同转向契约”放行——未知 FWID 可能来自别的项目或未经发布的分支。
+            foreach (FirmwareSuite suite in library.Suites)
+            {
+                if (!suite.Usable) continue;
+                FirmwareSpec spec = suite.SpecFor(role);
+                if (spec == null) continue;
+                if (!string.Equals(spec.Fwid, current.FirmwareId, StringComparison.Ordinal)) continue;
+                FwidInfo known = FwidInfo.Parse(spec.Fwid);
+                if (known.Role == role && FwidInfo.SameSteeringContract(known, actual))
+                    return current.FirmwareId;
+            }
+            problem = "固件 " + current.FirmwareId + " 不在本工具固件库中，或转向契约与库内固件不一致；" +
+                      "请先烧录对应发布固件再配对。";
+            return null;
+        }
+
+        // 最终查询：必须是 JAYv4+ 完整身份、角色正确、MAC 一致、PEER 正确、FWID 等于本轮清单。
+        private static string FinalCheck(BoardIdentity id, string expectedPeer, string expectedFwid, string label)
+        {
+            if (id == null) return label + "没有读到身份";
+            if (id.IdentityLineVersion < 4) return label + "身份行不是 JAYv4";
+            if (!id.HasFirmwareId) return label + "身份行缺少 FWID";
+            if (string.IsNullOrEmpty(id.Mac)) return label + "缺少有效本机 MAC";
+            if (!string.IsNullOrEmpty(expectedFwid) &&
+                !string.Equals(id.FirmwareId, expectedFwid, StringComparison.Ordinal))
+                return label + "固件身份 " + id.FirmwareId + " 与本轮清单不一致";
+            if (!string.Equals(id.Peer, MacText.NormalizePeer(expectedPeer), StringComparison.Ordinal))
+                return label + "对端是 " + id.PeerText + "，不是 " + expectedPeer;
+            return null;
         }
 
         private bool PeerPrecheck(ProbeResult probe, string port, BoardIdentity expected, string label, OperationResult result)

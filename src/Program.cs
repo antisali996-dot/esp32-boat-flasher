@@ -24,6 +24,27 @@ namespace BoatTool
             FirmwareLibrary library = FirmwareLibrary.Load(paths.FirmwareLibraryDir);
             RoleStore roles = new RoleStore(paths.RoleStorePath);
 
+            // 分类包带 preset.json；通用包没有这个文件，按任意芯片处理（仍核对 MAC）。
+            PresetConfig preset = null;
+            if (File.Exists(paths.PresetPath))
+            {
+                preset = PresetConfig.Load(paths.PresetPath);
+                // 按 preset 声明的套装 ID 找对应套装，而不是取“第一个可用套装”：
+                // 固件库里同时有 r10 和 r11 时，目录顺序会把 r10 排在前，按序号取会误判。
+                FirmwareSuite target = null;
+                if (!string.IsNullOrEmpty(preset.SuiteId))
+                {
+                    foreach (FirmwareSuite s in library.Suites)
+                        if (string.Equals(s.Id, preset.SuiteId, StringComparison.OrdinalIgnoreCase))
+                        { target = s; break; }
+                }
+                if (target == null)
+                {
+                    foreach (FirmwareSuite s in library.Suites) if (s.Usable) { target = s; break; }
+                }
+                preset.CrossCheck(target);
+            }
+
             StringBuilder warn = new StringBuilder();
             foreach (string problem in library.Problems) warn.AppendLine("· " + problem);
             foreach (FirmwareSuite suite in library.Suites)
@@ -44,7 +65,21 @@ namespace BoatTool
             }
 
             HardwareTransport transport = new HardwareTransport(paths, new SystemClock());
-            Application.Run(new MainForm(paths, library, roles, transport));
+            MainForm form = new MainForm(paths, library, roles, transport);
+            if (preset != null)
+            {
+                if (preset.Problems.Count > 0)
+                {
+                    MessageBox.Show("分类包预设自检未通过，已禁用烧录与配对：" + Environment.NewLine +
+                                    string.Join(Environment.NewLine, preset.Problems.ToArray()),
+                        "分类包配置有误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
+                else
+                {
+                    form.ApplyPreset(preset);
+                }
+            }
+            Application.Run(form);
         }
 
         // 供打包与交付后自检：不打开串口，只核对固件库、清单、镜像与 FWID。
@@ -58,6 +93,21 @@ namespace BoatTool
             StringBuilder text = new StringBuilder();
             text.AppendLine("固件库：" + library.Root);
             foreach (string problem in library.Problems) text.AppendLine("固件库问题：" + problem);
+
+            string presetPath = Path.Combine(root, "preset.json");
+            if (File.Exists(presetPath))
+            {
+                PresetConfig preset = PresetConfig.Load(presetPath);
+                text.AppendLine();
+                text.AppendLine("分类包预设：" + preset.Id + " / " + preset.Kind);
+                text.AppendLine("  " + preset.Describe());
+                foreach (string problem in preset.Problems) text.AppendLine("  预设问题：" + problem);
+            }
+            else
+            {
+                text.AppendLine();
+                text.AppendLine("分类包预设：无（通用包）");
+            }
 
             int usable = 0;
             foreach (FirmwareSuite suite in library.Suites)

@@ -7,3 +7,7 @@
 *.bin
 *.zip
 *.log
+
+/dist-*/
+
+/evidence.txt

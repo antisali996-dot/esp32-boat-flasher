@@ -37,6 +37,7 @@ namespace BoatTool
         public int ReadFlashCount;
         public int WriteFirmwareCount;
         public int WritePairCount;
+        public int VerifyPairCount;
         public int FailNextWrite;
         public int FailNextReadFlash;
         public bool ReportVerification = true;
@@ -105,6 +106,8 @@ namespace BoatTool
             id.PairProtocol = board.PairProtocol;
             id.SteeringAngle = board.SteerDeg;
             if (!board.Legacy) { id.FirmwareId = board.Fwid; id.FirmwareVersion = board.Version; }
+            // 模拟板子回的是 JAYv4 身份行（r7 固件就是 v4）；旧板为 0。
+            id.IdentityLineVersion = board.Legacy ? 0 : 4;
             id.RawLine = "SIM " + board.Mac;
             Events.Add("probe:" + port + ":" + board.Mac);
             return new ProbeResult { Ok = true, Identity = id };
@@ -183,26 +186,39 @@ namespace BoatTool
             return result;
         }
 
-        public PairWriteResult WritePair(string port, string peerMac, BoardIdentity expected, Logger log)
+        public PairWriteResult WritePair(string port, string peerMac, BoardIdentity expected, string expectedFwid,
+                                         Logger log)
         {
             WritePairCount++;
             SimBoard board = BoardOnPort(port);
             PairWriteResult result = new PairWriteResult();
-            if (board == null) { result.Error = "模拟：该串口没有板子"; return result; }
+            if (board == null)
+            {
+                result.Error = "模拟：该串口没有板子";
+                result.State = PairLinkState.FailedNeedsPowerCycle;
+                result.Message = result.Error;
+                return result;
+            }
             if (board.Mac != expected.Mac)
             {
                 result.Error = "写入配对前核对失败：当前板子与选定时不一致";
+                result.State = PairLinkState.FailedNeedsPowerCycle;
+                result.Message = result.Error;
                 return result;
             }
             if (board.SaveFails)
             {
                 result.Error = "板子拒绝保存配对：JAY ERROR=SAVE_FAILED";
+                result.State = PairLinkState.FailedNeedsPowerCycle;
+                result.Message = result.Error;
                 Events.Add("pairsavefail:" + board.Mac);
                 return result;
             }
             if (board.SaveNoAck)
             {
                 result.Error = "没有收到配对保存回应，不能认为配对成功";
+                result.State = PairLinkState.TimeoutUnknown;
+                result.Message = result.Error;
                 Events.Add("pairnoack:" + board.Mac);
                 return result;
             }
@@ -213,6 +229,8 @@ namespace BoatTool
             if (board.ReadBackPeerWrong)
             {
                 result.Error = "重启后读回的配对地址不是本次写入值，未通过核验";
+                result.State = PairLinkState.FailedNeedsPowerCycle;
+                result.Message = result.Error;
                 Events.Add("pairreadbackbad:" + board.Mac);
                 return result;
             }
@@ -224,10 +242,40 @@ namespace BoatTool
                 Peer = board.Peer,
                 SteeringAngle = board.SteerDeg,
                 FirmwareId = board.Fwid,
-                FirmwareVersion = board.Version
+                FirmwareVersion = board.Version,
+                IdentityLineVersion = 4
             };
+            result.State = PairLinkState.LocalVerified;
+            result.Message = "本端配对配置已核对";
             result.Ok = true;
             Events.Add("pair:" + board.Mac + "->" + peerMac);
+            return result;
+        }
+
+        public VerifyResult VerifyPairing(string port, BoardRole role, string expectedMac, string expectedPeer,
+                                          string expectedFwid, Logger log)
+        {
+            VerifyPairCount++;
+            SimBoard board = BoardOnPort(port);
+            VerifyResult result = new VerifyResult();
+            if (board == null) { result.Message = "模拟：该串口没有板子"; result.State = PairLinkState.TimeoutUnknown; return result; }
+            BoardIdentity id = new BoardIdentity
+            {
+                Responded = true, Role = board.Role, Mac = board.Mac, Peer = board.Peer,
+                SteeringAngle = board.SteerDeg, FirmwareId = board.Fwid, FirmwareVersion = board.Version,
+                IdentityLineVersion = 4
+            };
+            string mismatch = Verifier.Mismatch(id, role, expectedMac, expectedPeer, expectedFwid);
+            if (mismatch == null)
+            {
+                result.Ok = true; result.State = PairLinkState.LocalVerified; result.Identity = id;
+                result.Message = "只读核验通过";
+            }
+            else
+            {
+                result.State = PairLinkState.TimeoutUnknown; result.Identity = id;
+                result.Message = "只读核验未通过：" + mismatch;
+            }
             return result;
         }
     }

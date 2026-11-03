@@ -196,6 +196,51 @@ namespace BoatTool
             return null;
         }
 
+        // 配对核验专用：只接受带 FWID 的 JAYv4+ 完整行。
+        // 旧格式、READ_FAILED、缺字段、半行、无法解析一律拒绝，并给出中文原因。
+        public static bool TryParseStrict(string line, out BoardIdentity identity, out string reject)
+        {
+            identity = null;
+            reject = "";
+            if (string.IsNullOrEmpty(line)) { reject = "空行"; return false; }
+            if (line.IndexOf("MAC=READ_FAILED", StringComparison.Ordinal) >= 0 ||
+                line.IndexOf("SELF_MAC=READ_FAILED", StringComparison.Ordinal) >= 0 ||
+                line.IndexOf("READ_FAILED", StringComparison.Ordinal) >= 0)
+            {
+                reject = "板上报告自身 MAC 读取失败（READ_FAILED）";
+                return false;
+            }
+            Match strict = V3Pattern.Match(line);
+            if (!strict.Success)
+            {
+                if (LegacyPattern.IsMatch(line) || line.StartsWith("JAY ROLE=", StringComparison.Ordinal))
+                {
+                    reject = "只有旧格式身份行（无 FWID），不能用于核验";
+                    return false;
+                }
+                reject = "不是完整的 JAYv4 身份行";
+                return false;
+            }
+            BoardIdentity id = FromLine(line);
+            if (id == null || string.IsNullOrEmpty(id.Mac))
+            {
+                reject = "身份行缺少有效本机 MAC";
+                return false;
+            }
+            if (id.IdentityLineVersion < 4)
+            {
+                reject = "身份行版本为 JAYv" + id.IdentityLineVersion + "，低于 v4";
+                return false;
+            }
+            if (!id.HasFirmwareId)
+            {
+                reject = "身份行缺少 FWID";
+                return false;
+            }
+            identity = id;
+            return true;
+        }
+
         public static BoardIdentity FromLines(IList<string> lines)
         {
             if (lines == null) return null;
@@ -359,6 +404,8 @@ namespace BoatTool
         public string EsptoolPath;
         // 多套装：所有导入的发布包都在这个目录下，每个子目录是一套。
         public string FirmwareLibraryDir;
+        // 分类包预设；通用包没有这个文件。
+        public string PresetPath;
         public string WritableRoot;
         public string ConfigDir;
         public string RecordsDir;
@@ -370,6 +417,7 @@ namespace BoatTool
             AppPaths paths = new AppPaths();
             paths.AppRoot = AppDomain.CurrentDomain.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar);
             paths.FirmwareLibraryDir = Path.Combine(paths.AppRoot, "固件库");
+            paths.PresetPath = Path.Combine(paths.AppRoot, "preset.json");
             paths.FirmwareDir = Path.Combine(paths.AppRoot, "固件");
             paths.ToolDir = Path.Combine(paths.AppRoot, "工具");
             paths.ManifestPath = Path.Combine(paths.FirmwareDir, "固件清单.json");

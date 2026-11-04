@@ -88,19 +88,44 @@ namespace BoatTool
             return true;
         }
 
-        // 与所选套装交叉核对：分类包声明的 FWID 必须就是本包固件。
+        // 分类预设只强制角色与芯片 MAC；suite_id / boat_fwid / remote_fwid 只是
+        // 打包时的推荐信息，不永久锁死可选版本。版本核对以当前所选套装的清单为准。
+        //
+        //   RecommendedSuiteExists(library)  推荐套装是否还在（不在只提示，不禁用工具）
+        //   ApplySelection(...)              命中推荐且用户未选时给出推荐项；否则尊重用户选择
+        //
+        // 烧录身份核对一律使用所选套装的清单 FWID（见 Workflow），preset 的旧 FWID 只用于提示。
+        public bool RecommendedSuiteExists(FirmwareLibrary library)
+        {
+            if (string.IsNullOrEmpty(SuiteId)) return true;
+            return library != null && library.Find(SuiteId) != null;
+        }
+
+        public string RecommendText(FirmwareLibrary library)
+        {
+            if (string.IsNullOrEmpty(SuiteId)) return "";
+            if (RecommendedSuiteExists(library)) return "本包推荐套装：" + SuiteId + "（可改选其它有效版本）";
+            return "本包推荐套装 " + SuiteId + " 不在当前固件库里，请自行选择有效版本。";
+        }
+
+        // 兼容保留：仅在“套装就是推荐的那一套”时核对 FWID 一致性（提示打包错误用）。
+        // 不再作为通用前置校验，也不会因此禁用工具。
         public void CrossCheck(FirmwareSuite suite)
         {
             if (suite == null) { Problems.Add("固件库没有可用套装"); return; }
-            if (!string.IsNullOrEmpty(SuiteId) &&
-                !string.Equals(SuiteId, suite.Id, StringComparison.OrdinalIgnoreCase))
-                Problems.Add("preset 期望套装 " + SuiteId + "，实际是 " + suite.Id);
+            bool matchesRecommendation = string.IsNullOrEmpty(SuiteId) ||
+                string.Equals(SuiteId, suite.Id, StringComparison.OrdinalIgnoreCase);
+            if (!matchesRecommendation)
+            {
+                // 用户选了别的版本：不再报错。MAC 约束与烧录时的清单核对已覆盖安全。
+                return;
+            }
             FirmwareSpec boat = suite.SpecFor(BoardRole.Boat);
             FirmwareSpec remote = suite.SpecFor(BoardRole.Remote);
             if (!string.IsNullOrEmpty(BoatFwid) && (boat == null || boat.Fwid != BoatFwid))
-                Problems.Add("preset 的小船 FWID 与本包固件不一致");
+                Problems.Add("preset 的推荐小船 FWID 与该套装清单不一致（打包错误）");
             if (!string.IsNullOrEmpty(RemoteFwid) && (remote == null || remote.Fwid != RemoteFwid))
-                Problems.Add("preset 的遥控器 FWID 与本包固件不一致");
+                Problems.Add("preset 的推荐遥控器 FWID 与该套装清单不一致（打包错误）");
         }
 
         public string Describe()

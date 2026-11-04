@@ -49,16 +49,61 @@ namespace BoatTool
             return false;
         }
 
+        // 纯判断函数：只核对「完整 FWID + 角色 + 契约」，不写入任何授权状态。
+        // 调用前后不会改变后续诊断授权（无沉淀表、无学习式批准）。
+        // 旧包无契约字段时唯一放行途径是精确 FWID 白名单（明确限定的旧包兼容）。
+        public bool AllowsSuiteRole(FirmwareSpec spec, string boardFwid, BoardRole boardRole, out string reason)
+        {
+            reason = "";
+            if (spec == null) { reason = "本包清单没有该角色的固件"; return false; }
+            if (boardRole != spec.Role) { reason = "板上角色与清单角色不一致"; return false; }
+            if (string.IsNullOrEmpty(boardFwid) || !string.Equals(boardFwid, spec.Fwid, StringComparison.Ordinal))
+            { reason = "板上 FWID 不是本套装当前清单声明的那一条"; return false; }
+            string contract = spec.DiagContract;
+            if (string.IsNullOrEmpty(contract))
+            {
+                // 旧包没有契约字段：仅精确 FWID 白名单可放行。
+                if (Allows(boardFwid, boardRole))
+                { reason = "已批准 FWID 映射（旧包无契约字段）"; return true; }
+                reason = "该固件未声明诊断契约，也不在已批准映射中";
+                return false;
+            }
+            if (!DiagContracts.IsSupported(contract))
+            { reason = "诊断契约 " + contract + " 需要工具适配，当前只被动记录"; return false; }
+            return true;
+        }
+
         public bool Allows(string fwid)
         {
             return Allows(fwid, BoardRole.Boat);
         }
 
-        // 获批套装的能力表：逐条按 FWID + 角色登记，不用“前缀是 JAYFWB11 就全放行”的宽泛规则。
+        // 已实现并测试过的诊断协议契约。工具只认这里的固定只读查询，
+        // 不执行清单里的任何脚本或任意串口命令。
+        //   diag-v1：JAY COUNT（UInt64 保真）+ JAY FAULT（NONE/CURRENT/PREVIOUS，
+        //            严格数值校验）+ JAY ERROR=UNSUPPORTED_COMMAND 停用。r10/r11 实测。
+        public static class DiagContracts
+        {
+            public const string V1 = "diag-v1";
+            public static readonly string[] Supported = new string[] { V1 };
+
+            public static bool IsSupported(string contract)
+            {
+                if (string.IsNullOrEmpty(contract)) return false;
+                foreach (string s in Supported)
+                    if (string.Equals(s, contract, StringComparison.Ordinal)) return true;
+                return false;
+            }
+        }
+
+        // 获批能力表：逐条按「完整 FWID + 角色」登记，不按版本前缀放行。
         //
-        //   r10 小船 JAYFWB10-...-OS600-Cr10-diagshared  COUNT ✓ FAULT ✓
-        //   r11 小船 JAYFWB11-...-OSOFF-Cr11-osoff       COUNT ✓ FAULT ✓
-        //   遥控器（r10 / r11 均未实现 diagHooks）        无（零自动查询）
+        //   r10 小船 JAYFWB10-...-OS600-Cr10-diagshared  diag-v1  COUNT ✓ FAULT ✓
+        //   r11 小船 JAYFWB11-...-OSOFF-Cr11-osoff       diag-v1  COUNT ✓ FAULT ✓
+        //   遥控器（r10/r11 均未实现 diagHooks）          —        无（零自动查询）
+        //
+        // 新固件包可以在清单里声明 diag_contract="diag-v1" + 完整 FWID；
+        // 两者都匹配才启用查询。旧包缺该字段时仍走这张已批准映射。
         public static QueryPolicy ApprovedR11()
         {
             QueryPolicy p = new QueryPolicy();
@@ -69,10 +114,30 @@ namespace BoatTool
             return p;
         }
 
-        // 兼容旧名：仍返回同一张表（r10 + r11），避免出现两套不一致的批准列表。
+        // 兼容旧名：仍返回同一张表，避免出现两套不一致的批准列表。
         public static QueryPolicy ApprovedR10()
         {
             return ApprovedR11();
+        }
+    }
+
+    // 一次诊断能力解析的结论（三个使用方共享：界面显示 / StartRecording / PumpQueries）。
+    // 由 GUI 注入的 resolver 用「板上完整 FWID + 角色」查已校验的固件库条目后产生；
+    // 控制器本身不持有固件库，也不看界面下拉框选了什么。
+    public sealed class DiagCapability
+    {
+        public bool Allowed;
+        public string Reason = "";
+        public string Contract = "";       // 命中的契约 ID（旧包走精确映射时为 "approved-map"）
+        public string MatchedSuiteId = ""; // 命中的套装（多个命中且能力矛盾时为冲突列表）
+        public bool Conflicted;            // 多条目能力矛盾：停止自动查询并说明
+
+        public static DiagCapability Denied(string reason)
+        {
+            DiagCapability c = new DiagCapability();
+            c.Allowed = false;
+            c.Reason = reason ?? "";
+            return c;
         }
     }
 
@@ -105,6 +170,103 @@ namespace BoatTool
         private bool faultRoundPending;   // 本轮 COUNT 已结束，待发 FAULT
         private readonly int queryTimeoutMs = 2500;
         private bool queryWriteFailed;
+
+        // 能力解析回调：由 GUI 注入（根据板上 FWID+角色 查固件库），null 时退回 policy 精确映射。
+        private Func<string, BoardRole, DiagCapability> capabilityResolver;
+        // 身份确认后的能力解析结果（三个位置共用；身份变化时重算）。
+        private DiagCapability capability;
+
+        public void SetCapabilityResolver(Func<string, BoardRole, DiagCapability> resolver)
+        {
+            capabilityResolver = resolver;
+            capability = null;   // 解析器变化后强制重算
+        }
+
+        // 控制器可直接绑定固件库：未注入 resolver 时用这条共享路径解析。
+        public void SetFirmwareLibrary(FirmwareLibrary lib)
+        {
+            firmwareLibrary = lib;
+            capability = null;
+        }
+
+        private FirmwareLibrary firmwareLibrary;
+
+
+        // 共享的库驱动解析规则（GUI resolver 与控制器回退路径都用它）：
+        // 按「板上完整 FWID + 角色」找已校验条目；多命中矛盾即拒绝；契约必须已支持。
+        public static DiagCapability ResolveFromLibrary(FirmwareLibrary lib, QueryPolicy policy,
+                                                        string boardFwid, BoardRole boardRole)
+        {
+            if (string.IsNullOrEmpty(boardFwid) || boardRole == BoardRole.Unknown)
+                return DiagCapability.Denied("未读到板上固件身份或角色");
+            if (lib == null)
+                return DiagCapability.Denied("固件库不可用，无法核对板上固件条目");
+            List<FirmwareSuite> hits = lib.AllWithFwid(boardRole, boardFwid);
+            if (hits.Count == 0)
+                return DiagCapability.Denied("板上 FWID " + boardFwid + " 不在固件库任何已校验套装中，只被动记录");
+
+            List<KeyValuePair<string, FirmwareSpec>> entries = new List<KeyValuePair<string, FirmwareSpec>>();
+            List<string> unusable = new List<string>();
+            foreach (FirmwareSuite suite in hits)
+            {
+                if (!suite.Usable) { unusable.Add(suite.Id); continue; }
+                entries.Add(new KeyValuePair<string, FirmwareSpec>(suite.Id, suite.SpecFor(boardRole)));
+            }
+            bool anyAllowed = false, allAllowed = true;
+            string contract = "", suiteIds = "", deny = "";
+            foreach (FirmwareSuite suite in hits)
+            {
+                if (!suite.Usable) { allAllowed = false; if (deny.Length == 0) deny = "套装 " + suite.Id + " 自检未通过"; continue; }
+                FirmwareSpec spec = suite.SpecFor(boardRole);
+                string reason;
+                bool ok = policy.AllowsSuiteRole(spec, boardFwid, boardRole, out reason);
+                if (ok)
+                {
+                    anyAllowed = true;
+                    if (contract.Length == 0) contract = string.IsNullOrEmpty(spec.DiagContract) ? "approved-map" : spec.DiagContract;
+                }
+                else allAllowed = false;
+                if (suiteIds.Length > 0) suiteIds += "、";
+                suiteIds += suite.Id;
+            }
+            if (hits.Count > 1 && (anyAllowed && !allAllowed))
+                return DiagCapability.Denied("板上 FWID 命中多个条目（" + suiteIds + "）且诊断能力声明矛盾，已停止自动查询");
+            if (anyAllowed)
+                return new DiagCapability { Allowed = true, Contract = contract, MatchedSuiteId = suiteIds };
+            return DiagCapability.Denied("条目未启用诊断能力" + (deny.Length > 0 ? "（" + deny + "）" : "") + "，只被动记录");
+        }
+
+        // 解析当前板上身份的诊断能力（结果缓存；仅依赖板上身份，不依赖下拉选择）。
+        public DiagCapability ResolveCapability()
+        {
+            if (capability != null) return capability;
+            string fwid = SafeFwid();
+            BoardRole role = CurrentRole();
+            if (string.IsNullOrEmpty(fwid) || role == BoardRole.Unknown)
+            {
+                capability = DiagCapability.Denied("未读到板上固件身份或角色，不自动发送 COUNT/FAULT");
+                return capability;
+            }
+            if (capabilityResolver != null)
+            {
+                capability = capabilityResolver(fwid, role);
+                if (capability == null)
+                    capability = DiagCapability.Denied("能力解析返回空，按未确认处理");
+                return capability;
+            }
+            if (firmwareLibrary != null)
+            {
+                // 共享库路径：与 GUI resolver 同一实现。
+                capability = ResolveFromLibrary(firmwareLibrary, policy, fwid, role);
+                return capability;
+            }
+            // 无库也无 resolver：只有精确白名单（旧包无契约场景）可放行；
+            // 未声明契约的新固件不能通过任何旁路获得授权。
+            capability = policy.Allows(fwid, role)
+                ? new DiagCapability { Allowed = true, Reason = "已批准 FWID 映射", Contract = "approved-map" }
+                : DiagCapability.Denied("该固件不在已批准白名单，只被动记录");
+            return capability;
+        }
 
         private readonly List<CountSnapshot> counts = new List<CountSnapshot>();
         private readonly List<FaultSnapshot> faultsSeen = new List<FaultSnapshot>();
@@ -317,6 +479,7 @@ namespace BoatTool
                 identity = found;
                 deviceSegment = target;
                 currentBoot = "";
+                capability = null;   // 板上身份变化：能力解析重算
                 if (session != null) session.RecordIdentity(found, deviceSegment, clock.Now);
 
                 // 9) 用新设备上下文回放本批已落盘行（身份行之后的部分才进入业务解析）。
@@ -413,8 +576,14 @@ namespace BoatTool
             faultRoundPending = false;
             if (identity != null) session.RecordIdentity(identity, deviceSegment, clock.Now);
             Log("开始记录，目录：" + session.RootDir);
-            if (!policy.Allows(SafeFwid(), CurrentRole()))
-                Log("该角色/固件的接口能力未确认：本次不自动发送 JAY COUNT / JAY FAULT，只被动记录。");
+            // 能力解析与界面显示、PumpQueries 共用同一份结果（按板上身份，不按套装选择）。
+            DiagCapability cap = ResolveCapability();
+            if (!cap.Allowed)
+                Log("诊断接口未启用（" + cap.Reason + "）：本次不自动发送 JAY COUNT / JAY FAULT，只被动记录。");
+            else
+                Log("诊断接口已启用（契约 " + cap.Contract +
+                    (string.IsNullOrEmpty(cap.MatchedSuiteId) ? "" : "，套装 " + cap.MatchedSuiteId) +
+                    "）：记录期间按周期低频发送 JAY COUNT / JAY FAULT。");
             return true;
         }
 
@@ -610,6 +779,7 @@ namespace BoatTool
                 if (id != null)
                 {
                     identity = id;
+                    capability = null;   // 板上身份变化：能力解析重算
                     if (session != null) session.RecordIdentity(id, deviceSegment, clock.Now);
                 }
             }
@@ -620,7 +790,8 @@ namespace BoatTool
         private void PumpQueries()
         {
             if (state != DiagState.Recording) return;
-            if (!policy.Allows(SafeFwid(), CurrentRole())) return;
+            // 与界面/StartRecording 共用同一份能力解析结果；未允许则零自动查询。
+            if (!ResolveCapability().Allowed) return;
             DateTime now = clock.Now;
 
             if (queryInFlight && (now - inFlightSentAt).TotalMilliseconds > queryTimeoutMs)

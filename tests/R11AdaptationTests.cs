@@ -209,11 +209,17 @@ namespace BoatTool
             preset.CrossCheck(byId);
             Check("按 suite_id 交叉核对通过", preset.Problems.Count == 0,
                 string.Join("；", preset.Problems.ToArray()));
-            // 反向证明：若按“第一个可用套装”核对会失败
-            PresetConfig wrong = PresetConfig.Load(paths.PresetPath);
-            wrong.CrossCheck(library.Suites[0]);
-            Check("按第一个可用套装核对确实会失败（说明必须按 id）", wrong.Problems.Count > 0,
-                "未产生问题，无法证明");
+            // preset 解绑版本（动态固件库轮）：CrossCheck 对非推荐套装不再报错，
+            // 用户改选其它有效版本不会被禁用；MAC 保护不受影响。
+            PresetConfig other = PresetConfig.Load(paths.PresetPath);
+            other.CrossCheck(library.Suites[0]);
+            Check("选择非推荐套装不再产生 preset 问题（版本不锁死）", other.Problems.Count == 0,
+                "仍被锁死：" + string.Join("；", other.Problems.ToArray()));
+            string macReason;
+            Check("MAC 约束仍在（category AllowsBoat）",
+                other.IsCategory == false || other.BoatMac.Length == 0 ||
+                other.AllowsBoat("AA:BB:CC:DD:EE:FF", out macReason) == false,
+                "MAC 保护丢失");
         }
 
         // ---------- 8. 诊断能力按板上身份 ----------

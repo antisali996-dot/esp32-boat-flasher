@@ -10,13 +10,22 @@ namespace BoatTool
     public class MainForm : Form, IUserInteraction
     {
         private readonly AppPaths paths;
-        private readonly FirmwareLibrary library;
+        // 固件库允许“刷新固件库”时整体替换（构造函数初始化，ReplaceLibrary 统一替换）。
+        // 必须是普通字段：readonly 会让刷新路径 CS0191。
+        private FirmwareLibrary library;
         private readonly RoleStore roles;
         private readonly IBoardTransport transport;
         private readonly Workflow workflow;
 
         private readonly ListView portList = new ListView();
         private readonly ComboBox suiteChoice = new ComboBox();
+        private bool suppressSuiteSelectionEvent;   // 重建下拉期间抑制选择事件写回
+        private sealed class SuiteChoiceItem
+        {
+            public readonly FirmwareSuite Suite;
+            public SuiteChoiceItem(FirmwareSuite suite) { Suite = suite; }
+            public override string ToString() { return Suite == null ? "" : Suite.Display; }
+        }
         private readonly Label suiteInfo = new Label();
         private readonly CheckBox forceReflashCheck = new CheckBox();
         private readonly ComboBox roleChoice = new ComboBox();
@@ -24,6 +33,7 @@ namespace BoatTool
         private readonly ComboBox remotePortChoice = new ComboBox();
         private readonly CheckBox backupBeforeFlash = new CheckBox();
         private readonly Button refreshButton = new Button();
+        private readonly Button refreshLibraryButton = new Button();
         private readonly Button flashButton = new Button();
         private readonly Button pairButton = new Button();
         private readonly Button verifyButton = new Button();
@@ -325,11 +335,72 @@ namespace BoatTool
             else if (diagPortChoice.Items.Count > 0) diagPortChoice.SelectedIndex = 0;
         }
 
+        // 诊断能力解析（界面显示与控制器 PumpQueries 共用同一实现）：
+        // 规则统一放在 DiagnosticsController.ResolveFromLibrary；此处只做转发，
+        // 保证界面显示与实际查询用的是同一份结论。
+        private DiagCapability ResolveCapabilityFor(string boardFwid, BoardRole boardRole)
+        {
+            return DiagnosticsController.ResolveFromLibrary(library, diagPolicy, boardFwid, boardRole);
+        }
+
+        private DiagCapability ResolveCapabilityForLegacyImpl(string boardFwid, BoardRole boardRole)
+        {
+            if (string.IsNullOrEmpty(boardFwid) || boardRole == BoardRole.Unknown)
+                return DiagCapability.Denied("未读到板上固件身份或角色");
+            FirmwareLibrary lib = library;
+            if (lib == null || lib.Suites.Count == 0)
+                return DiagCapability.Denied("固件库为空，无法核对板上固件条目");
+
+            List<FirmwareSuite> hits = lib.AllWithFwid(boardRole, boardFwid);
+            if (hits.Count == 0)
+                return DiagCapability.Denied("板上 FWID " + boardFwid + " 不在固件库任何已校验套装中，只被动记录");
+
+            // 逐条目按角色能力判定；出现“允许/不允许”矛盾即停止自动查询。
+            bool anyAllowed = false;
+            bool allAllowed = true;
+            string contract = "";
+            string suiteIds = "";
+            string denyReason = "";
+            foreach (FirmwareSuite suite in hits)
+            {
+                if (!suite.Usable) { allAllowed = false; if (denyReason.Length == 0) denyReason = "套装 " + suite.Id + " 自检未通过"; continue; }
+                FirmwareSpec spec = suite.SpecFor(boardRole);
+                string reason;
+                bool ok = diagPolicy.AllowsSuiteRole(spec, boardFwid, boardRole, out reason);
+                if (ok)
+                {
+                    anyAllowed = true;
+                    if (contract.Length == 0) contract = string.IsNullOrEmpty(spec.DiagContract) ? "approved-map" : spec.DiagContract;
+                }
+                else allAllowed = false;
+                if (suiteIds.Length > 0) suiteIds += "、";
+                suiteIds += suite.Id;
+            }
+            if (hits.Count > 1 && (anyAllowed && !allAllowed))
+                return DiagCapability.Denied("板上 FWID 命中多个条目（" + suiteIds + "）且诊断能力声明矛盾，已停止自动查询");
+
+            if (anyAllowed)
+            {
+                DiagCapability cap = new DiagCapability();
+                cap.Allowed = true;
+                cap.Reason = "命中固件库条目（" + suiteIds + "）";
+                cap.Contract = contract;
+                cap.MatchedSuiteId = suiteIds;
+                cap.Conflicted = hits.Count > 1;
+                return cap;
+            }
+            return DiagCapability.Denied("板上 FWID " + boardFwid + " 的条目未启用诊断能力" +
+                                        (denyReason.Length > 0 ? "（" + denyReason + "）" : "") + "，只被动记录");
+        }
+
         private void EnsureDiag()
         {
             if (diag != null) return;
             IDiagChannel channel = new SerialDiagChannel(115200, DiagAppend);
             diag = new DiagnosticsController(paths, channel, new SystemDiagClock(), diagPolicy, DiagAppend);
+            // 库引用 + 解析器：控制器内部回退路径与 GUI resolver 都走 ResolveFromLibrary。
+            diag.SetFirmwareLibrary(library);
+            diag.SetCapabilityResolver(ResolveCapabilityFor);
             diag.PortLocks = portLocks;
             workflow.PortLocks = portLocks;
         }
@@ -494,21 +565,23 @@ namespace BoatTool
             diagRunLabel.Text = "最近一次可识别运行状态：" +
                 (string.IsNullOrEmpty(diag.LastRunState) ? "未知" : diag.LastRunState);
             diagDirLabel.Text = "本地记录目录：" + (diag.Session == null ? "未开始" : diag.Session.RootDir);
-            BoardRole role = id == null ? BoardRole.Unknown : id.Role;
-            bool confirmed = diagPolicy.Allows(id != null && id.HasFirmwareId ? id.FirmwareId : "", role);
-            if (confirmed)
+            // 与控制器实际查询能力共用同一份解析结果（ResolveCapability 缓存，身份变化自动重算）。
+            DiagCapability cap = diag.ResolveCapability();
+            if (cap.Allowed)
             {
-                diagSupportLabel.Text = "接口支持：已确认白名单（记录中会低频查询 COUNT/FAULT）";
+                diagSupportLabel.Text = "接口支持：已启用（契约 " + cap.Contract +
+                    (string.IsNullOrEmpty(cap.MatchedSuiteId) ? "" : "，条目 " + cap.MatchedSuiteId) +
+                    "）；记录中会低频查询 COUNT/FAULT";
             }
-            else if (role == BoardRole.Remote)
+            else if (id != null && id.Role == BoardRole.Remote)
             {
                 diagSupportLabel.Text = "接口支持：遥控器不提供 COUNT/FAULT（只被动记录）";
             }
             else
             {
-                diagSupportLabel.Text = "接口支持：未确认（只被动记录，不自动发送 COUNT/FAULT）";
+                diagSupportLabel.Text = "接口支持：未启用（" + cap.Reason + "）";
             }
-            diagSupportLabel.ForeColor = confirmed ? Color.FromArgb(20, 110, 60) : Color.FromArgb(150, 90, 0);
+            diagSupportLabel.ForeColor = cap.Allowed ? Color.FromArgb(20, 110, 60) : Color.FromArgb(150, 90, 0);
 
             // 故障证据：只读汇总 + 最近一行的状态（完整/不完整/冲突/启动未确认/待适配）。
             FaultSnapshot latest = diag.LatestFault;
@@ -604,6 +677,9 @@ namespace BoatTool
             Text = "ESP32 小船 / 遥控器烧录配对工具（" + preset.Title + "）";
             AppendLog("分类包预设：" + preset.Describe());
             AppendLog("本包只允许操作上述两块芯片；地址不符会拒绝写入与绑定。");
+            // 推荐信息：只提示，不锁死版本。默认仍选推荐/最新套装，但用户改选有效版本不会被拒绝。
+            string rec = preset.RecommendText(library);
+            if (rec.Length > 0) AppendLog(rec);
         }
 
         // 固件套装独立成组：这是“要写入什么”的唯一来源，避免和串口选择混在一起被误读。
@@ -639,6 +715,15 @@ namespace BoatTool
             suiteChoice.Margin = new Padding(0, 4, 6, 0);
             suiteChoice.SelectedIndexChanged += delegate { OnSuiteChanged(); };
             left.Controls.Add(suiteChoice);
+
+            // 刷新固件库：重新扫描 固件库\ 下全部套装目录并重新校验文件。
+            // 只读磁盘：不打开串口、不复位板子、不写设备（与“刷新列表”的串口刷新互不影响）。
+            refreshLibraryButton.Text = "刷新固件库";
+            refreshLibraryButton.Width = 110;
+            refreshLibraryButton.Height = 28;
+            refreshLibraryButton.Margin = new Padding(0, 4, 0, 0);
+            refreshLibraryButton.Click += delegate { RefreshLibrary(); };
+            left.Controls.Add(refreshLibraryButton);
             layout.Controls.Add(left, 0, 0);
 
             suiteInfo.AutoSize = false;
@@ -836,21 +921,136 @@ namespace BoatTool
         }
 
         // 套装下拉：只列可用套装；不可用的也显示出来并标红说明原因，避免用户以为“没有这套”。
+        // 重新扫描固件库。规则：
+        //   * 只读磁盘：不打开串口、不发送命令、不复位；
+        //   * 烧录/配对进行中（busy）或诊断记录中：拒绝刷新，防止替换正在使用的计划；
+        //   * 原选择仍存在且内容未变 → 保留选择；
+        //   * 原选择消失/失效/内容变化 → 清除旧计划并提示重新选择；
+        //   * 不保留指向旧镜像的缓存：library 对象整体重建。
+        private void RefreshLibrary()
+        {
+            if (busy)
+            {
+                AppendLog("操作进行中，暂不能刷新固件库。");
+                return;
+            }
+            if (diag != null && (diag.State == DiagState.Recording ||
+                (diag.Session != null && !diag.Session.IsClosed)))
+            {
+                AppendLog("现场诊断记录中（或会话尚未关闭），暂不能刷新固件库（防止替换正在使用的记录环境）。");
+                return;
+            }
+
+            FirmwareSuite previous = workflow.SelectedSuite;
+            string previousId = previous == null ? "" : previous.Id;
+
+            FirmwareLibrary fresh;
+            try { fresh = FirmwareLibrary.Load(library.Root); }
+            catch (Exception ex)
+            {
+                AppendLog("刷新固件库失败：" + ex.Message);
+                return;
+            }
+
+            // 共享生产入口：替换库 + 通知所有使用方（Workflow、诊断控制器、能力缓存）
+            // + 旧选择去留判定，只有这一份实现（测试也直接调用它）。
+            FirmwareSuite newSelection;
+            string decision = FirmwareLibrary.ApplyFirmwareLibraryRefresh(
+                library, fresh, previous,
+                delegate(FirmwareLibrary newLib)
+                {
+                    // 1) MainForm 使用的库
+                    library = newLib;
+                    // 2) Workflow 使用的库（同时清除旧烧录计划引用）
+                    workflow.UpdateLibrary(newLib);
+                    // 3) 诊断控制器已创建时绑定同一个新库并清除能力缓存；
+                    //    尚未创建时不创建、不打开任何串口（EnsureDiag 首次使用时自会绑定当前库）。
+                    if (diag != null) diag.SetFirmwareLibrary(newLib);
+                },
+                out newSelection);
+
+            int usable = 0;
+            foreach (FirmwareSuite s in library.Suites) if (s.Usable) usable++;
+            AppendLog("已刷新固件库：共 " + library.Suites.Count + " 套，可用 " + usable + " 套。");
+            foreach (string problem in library.Problems) AppendLog("固件库问题：" + problem);
+            foreach (FirmwareSuite s in library.Suites)
+            {
+                if (!s.Usable) AppendLog("套装不可用：" + s.Id + " —— " + string.Join("；", s.Problems.ToArray()));
+                foreach (string note in s.Notes) AppendLog("套装提示：" + s.Id + " —— " + note);
+            }
+
+            // 共享协调方法重建下拉（抑制事件）+ 按决策恢复/清除选中 + 统一回调一次。
+            FirmwareLibrary.RebuildSuiteChoicesAfterRefresh(new FirmwareLibrary.SuiteChoiceHost
+            {
+                GetSelected = delegate { SuiteChoiceItem item = suiteChoice.SelectedItem as SuiteChoiceItem; return item == null ? null : item.Suite; },
+                ClearItems = delegate { suppressSuiteSelectionEvent = true; suiteChoice.Items.Clear(); },
+                AddItem = delegate(FirmwareSuite suite) { suiteChoice.Items.Add(new SuiteChoiceItem(suite)); },
+                SetSelectedIndex = delegate(int index)
+                {
+                    suppressSuiteSelectionEvent = true;
+                    suiteChoice.SelectedIndex = index;   // -1 = 无选中
+                },
+                ResumeEvents = delegate { suppressSuiteSelectionEvent = false; },
+                // 重建结束、事件已恢复后只调用一次统一实现（此刻下拉里是新库对象或 -1）。
+                OnSelectionFinalized = ApplySuiteSelection,
+            }, library, decision, newSelection);
+
+            // 中文提示（newSelection 为空绝不访问 Display）。
+            switch (decision)
+            {
+                case "keep":
+                    if (newSelection != null)
+                        AppendLog("已保留原选择：" + newSelection.Display);
+                    else
+                        AppendLog("固件库已刷新，当前未选择套装。");
+                    break;
+                case "missing":
+                    AppendLog("原选择的套装 " + previousId + " 已不存在，请重新选择。");
+                    break;
+                case "changed":
+                    AppendLog("套装 " + previousId + " 的内容在刷新后已变化，旧烧录计划已清除；请重新选择。");
+                    break;
+                case "unusable":
+                    FirmwareSuite failed = library.Find(previousId);
+                    AppendLog("套装 " + previousId + " 现在自检未通过：" +
+                              (failed == null ? "" : string.Join("；", failed.Problems.ToArray())) +
+                              "。请重新选择。");
+                    break;
+                default:
+                    if (library.Suites.Count == 0)
+                        AppendLog("固件库为空。请把发布包解压到固件库目录后重新刷新。");
+                    else
+                        AppendLog("固件库已刷新，当前未选择套装。");
+                    break;
+            }
+        }
+
+        // 套装最终状态的唯一实现：首次初始化、用户手动选择、刷新固件库完成，三条入口都只调用这里。
+        // 以“下拉框当前选中项”为唯一事实来源写回 Workflow，并同步摘要、按钮、板子备注与诊断标签。
+        // 只读界面与内存中的固件库：不创建诊断控制器、不枚举串口、不打开串口、不发送命令。
+        private void ApplySuiteSelection()
+        {
+            SuiteChoiceItem item = suiteChoice.SelectedItem as SuiteChoiceItem;
+            FirmwareSuite suite = item == null ? null : item.Suite;
+            workflow.SelectedSuite = suite;
+            UpdateSuiteInfo(suite);
+            UpdateActionState();
+            RescanNotes();
+            // diag 未创建时只写“未连接”，绝不在这里创建控制器（避免顺带打开串口）。
+            UpdateDiagLabels();
+        }
+
+        // 该套装两端应用镜像的复合指纹（刷新前后比较用）。
+
         private void FillSuites()
         {
             suiteChoice.Items.Clear();
-            if (library.Suites.Count == 0)
-            {
-                suiteInfo.Text = "固件库里没有可用套装。";
-                suiteInfo.ForeColor = Color.FromArgb(178, 58, 40);
-                return;
-            }
             int usableIndex = -1;
             int preferredIndex = -1;
             for (int i = 0; i < library.Suites.Count; i++)
             {
                 FirmwareSuite suite = library.Suites[i];
-                SuiteItem item = new SuiteItem(suite);
+                SuiteChoiceItem item = new SuiteChoiceItem(suite);
                 suiteChoice.Items.Add(item);
                 if (suite.Usable && usableIndex < 0) usableIndex = i;
                 // 默认优先选 r11（锁存已关闭的当前版本），但不能因此把不可用套装选中。
@@ -859,36 +1059,37 @@ namespace BoatTool
                     preferredIndex = i;
             }
             if (preferredIndex >= 0) usableIndex = preferredIndex;
+            suppressSuiteSelectionEvent = true;
+            // 空库时不能给 ComboBox 赋 0（会抛 ArgumentOutOfRangeException），显式置 -1。
             if (usableIndex >= 0) suiteChoice.SelectedIndex = usableIndex;
-            else suiteChoice.SelectedIndex = 0;
-            OnSuiteChanged();
+            else if (suiteChoice.Items.Count > 0) suiteChoice.SelectedIndex = 0;
+            else suiteChoice.SelectedIndex = -1;
+            suppressSuiteSelectionEvent = false;
+            // 默认选中后同样走统一实现：首次启动的摘要必须与实际选择一致。
+            ApplySuiteSelection();
         }
 
-        private class SuiteItem
-        {
-            public readonly FirmwareSuite Suite;
-            public SuiteItem(FirmwareSuite suite) { Suite = suite; }
-            public override string ToString()
-            {
-                // 下拉里只放“转速 / 角度 + 版本”，完整 FWID 与清单摘要在右侧信息区。
-                if (Suite.Usable) return Suite.DisplayName + "（" + Suite.LockoutText + "，版本 " + Suite.Version + "）";
-                return Suite.Id + "（不可用）";
-            }
-        }
 
         private FirmwareSuite currentSuite()
         {
-            SuiteItem item = suiteChoice.SelectedItem as SuiteItem;
+            SuiteChoiceItem item = suiteChoice.SelectedItem as SuiteChoiceItem;
             return item == null ? null : item.Suite;
         }
 
         private void OnSuiteChanged()
         {
-            FirmwareSuite suite = currentSuite();
-            workflow.SelectedSuite = suite;
+            if (suppressSuiteSelectionEvent) return;   // 重建下拉期间不写回
+            ApplySuiteSelection();
+        }
+
+        private void UpdateSuiteInfo(FirmwareSuite suite)
+        {
             if (suite == null)
             {
-                suiteInfo.Text = "未选择套装。";
+                // 无选择时要区分“库里根本没有套装”和“有套装但未选中”，避免用户误以为选错了。
+                suiteInfo.Text = library.Suites.Count == 0
+                    ? "固件库里没有可用套装。"
+                    : "未选择套装。";
                 suiteInfo.ForeColor = Color.FromArgb(178, 58, 40);
             }
             else if (!suite.Usable)
@@ -905,9 +1106,6 @@ namespace BoatTool
                                  Environment.NewLine + "遥控器  " + (remote == null ? "缺失" : remote.Fwid);
                 suiteInfo.ForeColor = Color.FromArgb(60, 64, 72);
             }
-            UpdateActionState();
-            // 套装切换后重新给每块板标注“是否需要升级/是否属于另一套”。
-            RescanNotes();
         }
 
         // 不重新访问串口，只按已扫描到的身份重算说明文字。
@@ -924,7 +1122,9 @@ namespace BoatTool
                 if (spec == null) continue;
                 string note;
                 if (string.Equals(scan.Identity.FirmwareId, spec.Fwid, StringComparison.Ordinal))
-                    note = "与所选套装一致，无需重复烧录";
+                    note = "固件身份匹配，板上镜像内容未核验" +
+                        (workflow.IsImageAmbiguous(scan.Identity.Role, scan.Identity)
+                            ? "（库内存在同身份异镜像）" : "");
                 else
                 {
                     List<FirmwareSuite> owners = library.AllWithFwid(scan.Identity.Role, scan.Identity.FirmwareId);

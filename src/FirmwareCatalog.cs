@@ -80,6 +80,8 @@ namespace BoatTool
         public long BootApp0Offset = -1;
         // 清单声明的锁存状态；最终以 FWID 为交叉核对依据。
         public OverspeedLockout LockoutDeclared = OverspeedLockout.Unknown;
+        // 清单声明的诊断协议契约 ID（如 diag-v1）。空表示未声明 → 只被动记录。
+        public string DiagContract = "";
         // 该角色的超速锁定结论（清单声明与 FWID 一致时才有值，矛盾时套装不可用）。
         public OverspeedLockout Lockout = OverspeedLockout.Unknown;
 
@@ -168,18 +170,32 @@ namespace BoatTool
                         spec.Fwid = Json.GetString(obj, "fwid", "");
                         spec.Version = Json.GetString(obj, "version", catalog.Version);
                         spec.SteerDeg = Json.GetInt(obj, "steer_deg", catalog.SteerDeg);
-                        spec.AppPath = Path.Combine(dir, Json.GetString(obj, "app", ""));
+                        string appRel = Json.GetString(obj, "app", "");
+                        if (!IsSafeRelative(appRel))
+                            catalog.Problems.Add(RoleNames.Chinese(role) + "应用镜像路径不安全（必须是套装内的相对路径）：" + appRel);
+                        spec.AppPath = Path.Combine(dir, appRel);
                         spec.AppOffset = Json.GetInt(obj, "app_offset", -1);
-                        spec.BootloaderPath = Path.Combine(dir, Json.GetString(obj, "bootloader", ""));
                         spec.BootloaderOffset = Json.GetInt(obj, "bootloader_offset", -1);
-                        spec.PartitionsPath = Path.Combine(dir, Json.GetString(obj, "partitions", ""));
                         spec.PartitionsOffset = Json.GetInt(obj, "partitions_offset", -1);
-                        spec.BootApp0Path = Path.Combine(dir, Json.GetString(obj, "boot_app0", ""));
+                        string blRel = Json.GetString(obj, "bootloader", "");
+                        if (!IsSafeRelative(blRel))
+                            catalog.Problems.Add(RoleNames.Chinese(role) + "bootloader 路径不安全（必须是套装内的相对路径）：" + blRel);
+                        spec.BootloaderPath = Path.Combine(dir, blRel);
+                        string ptRel = Json.GetString(obj, "partitions", "");
+                        if (!IsSafeRelative(ptRel))
+                            catalog.Problems.Add(RoleNames.Chinese(role) + "分区表路径不安全（必须是套装内的相对路径）：" + ptRel);
+                        spec.PartitionsPath = Path.Combine(dir, ptRel);
+                        string baRel = Json.GetString(obj, "boot_app0", "");
+                        if (!IsSafeRelative(baRel))
+                            catalog.Problems.Add(RoleNames.Chinese(role) + "OTA 选择文件路径不安全（必须是套装内的相对路径）：" + baRel);
+                        spec.BootApp0Path = Path.Combine(dir, baRel);
                         spec.BootApp0Offset = Json.GetInt(obj, "boot_app0_offset", -1);
                         spec.LockoutDeclared = OverspeedLockoutText.Parse(
                             Json.GetString(obj, "overspeed_lockout", ""));
                         if (spec.LockoutDeclared == OverspeedLockout.Unknown && catalog.LockoutDeclared != OverspeedLockout.Unknown)
                             spec.LockoutDeclared = catalog.LockoutDeclared;
+                        spec.DiagContract = Json.GetString(obj, "diag_contract",
+                            Json.GetString(root, "diag_contract", ""));
                         catalog.Roles[role] = spec;
                     }
                 }
@@ -190,6 +206,21 @@ namespace BoatTool
             }
             catalog.SelfCheck();
             return catalog;
+        }
+
+        // 相对路径安全检查：非空、非绝对、不含 .. 或 . 段。镜像必须属于本套装目录。
+        public static bool IsSafeRelative(string rel)
+        {
+            if (string.IsNullOrEmpty(rel)) return false;
+            if (rel.IndexOf('~') >= 0) return false;
+            if (Path.IsPathRooted(rel)) return false;
+            string[] parts = rel.Replace('\\', '/').Split('/');
+            foreach (string part in parts)
+            {
+                if (part.Length == 0) continue;
+                if (part == "." || part == "..") return false;
+            }
+            return true;
         }
 
         // 清单、镜像与身份串必须互相自证，避免"说明写 20 度、固件其实是旧程序"。

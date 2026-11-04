@@ -1,4 +1,4 @@
-﻿param([string]$Stage = 'work\r11-stage', [string]$OutDir = 'dist-r11')
+﻿param([string]$Stage = 'work\r11-stage', [string]$OutDir = 'dist-r11-round5fix')
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location -LiteralPath $root
@@ -103,6 +103,7 @@ foreach ($dir in Get-ChildItem -LiteralPath $stagePath -Directory) {
     if ($preset.id -notlike 'r11-*') { throw "$name preset id 不是 r11" }
     if (-not (Test-Path (Join-Path $inner '现场诊断-使用说明.txt'))) { throw "$name 缺少诊断说明" }
     if (-not (Test-Path (Join-Path $inner '测试记录\测试结果.txt'))) { throw "$name 缺少测试记录" }
+    if (-not (Test-Path (Join-Path $inner '固件套装格式规范.md'))) { throw "$name 缺少固件套装格式规范" }
 
     # 无设备自检：不启动 GUI（GUI 会枚举串口），只用 --self-check 覆盖的静态校验
     $results += [pscustomobject]@{

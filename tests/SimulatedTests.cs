@@ -446,12 +446,57 @@ namespace BoatTool
                 Path.Combine(root, "a"));
             Directory.Move(MakeSuiteDir("b", "20261103-590rpm-r4", 590, Fwid580Boat, Fwid590Remote),
                 Path.Combine(root, "b"));
+            // 动态固件库新规则分三类：
+            //   a/b 两套的小船镜像内容相同（同 FWID 同镜像）→ B 类，允许并存并提示。
             FirmwareLibrary mixed = FirmwareLibrary.Load(root);
-            bool flagged = false;
+            bool sameImageNote = false;
             foreach (FirmwareSuite suite in mixed.Suites)
-                foreach (string problem in suite.Problems)
-                    if (problem.Contains("重复")) flagged = true;
-            Check("两套共用同一小船 FWID 被标记", flagged, "重复 FWID 未被发现");
+                foreach (string note in suite.Notes)
+                    if (note.Contains("镜像哈希一致")) sameImageNote = true;
+            Check("同 FWID 同镜像的两个套装允许并存（B 类提示）", sameImageNote, "未生成 B 类提示");
+            // b 的清单 target_rpm=590 与其 FWID 的 R580 不一致 → 属于 D 类（数据不自洽），
+            // 该套仍然不可用；a 不受牵连。B 类提示只说明“a 的小船镜像是该 FWID 的一个发布”。
+            FirmwareSuite suiteA = null, suiteB = null;
+            foreach (FirmwareSuite suite in mixed.Suites)
+            {
+                if (suite.Id == "a") suiteA = suite;
+                if (suite.Id == "b") suiteB = suite;
+            }
+            Check("B 类不算错误，a 套装仍可用", suiteA != null && suiteA.Problems.Count == 0,
+                suiteA == null ? "a 缺失" : "a 被误判：" + string.Join("/", suiteA.Problems.ToArray()));
+            Check("b 套装因清单转速与 FWID 不符仍不可用（D 类拒绝保留）",
+                suiteB != null && suiteB.Problems.Count > 0, "b 意外可用");
+
+            //   把 b 的小船镜像改掉 → 同 FWID 不同镜像 → C 类，提示不确定性。
+            string fwB = Path.Combine(root, "b", "固件");
+            File.WriteAllBytes(Path.Combine(fwB, "boat-app.bin"),
+                Encoding.ASCII.GetBytes("BOAT APP " + Fwid580Boat + " TAMPERED"));
+            FirmwareLibrary mixed2 = FirmwareLibrary.Load(root);
+            bool diffImageNote = false;
+            foreach (FirmwareSuite suite in mixed2.Suites)
+                foreach (string note in suite.Notes)
+                    if (note.Contains("镜像哈希不同")) diffImageNote = true;
+            Check("同 FWID 不同镜像生成 C 类提示", diffImageNote, "未生成 C 类提示");
+            // C 类验证在独立干净库中做（不与转速不符的 b 混在一起）。
+            string cleanRoot = Path.Combine(workRoot, "clean-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(cleanRoot);
+            Directory.Move(MakeSuiteDir("c1", "20261103-20deg-r3", 580, Fwid580Boat, Fwid580Remote),
+                Path.Combine(cleanRoot, "c1"));
+            Directory.Move(MakeSuiteDir("c2", "20261103-20deg-r3b", 580, Fwid580Boat, Fwid580Remote),
+                Path.Combine(cleanRoot, "c2"));
+            string fwC2 = Path.Combine(cleanRoot, "c2", "固件");
+            File.WriteAllBytes(Path.Combine(fwC2, "boat-app.bin"),
+                Encoding.ASCII.GetBytes("BOAT APP " + Fwid580Boat + " TAMPERED"));
+            FirmwareLibrary clean = FirmwareLibrary.Load(cleanRoot);
+            bool bothUsable = true;
+            foreach (FirmwareSuite suite in clean.Suites)
+                if (suite.Problems.Count > 0) bothUsable = false;
+            bool cNote = false;
+            foreach (FirmwareSuite suite in clean.Suites)
+                foreach (string note in suite.Notes)
+                    if (note.Contains("镜像哈希不同")) cNote = true;
+            Check("C 类（同 FWID 不同镜像）两套仍可用", bothUsable && cNote,
+                "可用=" + bothUsable + "，提示=" + cNote);
 
             string same = MakeSuiteDir("same", "20261103-20deg-r3", 580, Fwid580Boat, Fwid580Remote);
             string fw = Path.Combine(same, "固件");
@@ -702,11 +747,14 @@ namespace BoatTool
             Workflow flow = MakeWorkflow(transport, ui,
                 new RoleStore(Path.Combine(workRoot, "matched-" + Guid.NewGuid().ToString("N") + ".json")), null, "580-20-r3");
             PortScan scan = flow.Scan()[0];
-            Check("已匹配时备注写明无需重复烧录", scan.Note.Contains("无需重复烧录"), "备注未提示：" + scan.Note);
+            // 修复三（身份一致 != 镜像一致）：备注与结果不再宣称"无需重复烧录/完全一致"，
+            // 统一按"身份匹配、镜像内容未核验"表述；跳过写入行为保留。
+            Check("已匹配时备注写明镜像未核验", scan.Note.Contains("未核验"), "备注未提示：" + scan.Note);
 
             OperationResult noReflash = flow.FlashCurrent(scan, BoardRole.Boat, false, false);
             Check("不勾选重刷时不写入", noReflash.Ok && transport.WriteFirmwareCount == 0 &&
-                  noReflash.Summary.Contains("无需重复烧录"), "已匹配时仍然写入");
+                  noReflash.Summary.Contains("未核验") &&
+                  noReflash.Summary.Contains("未写入"), "已匹配时文案不实或仍然写入");
             Check("不勾选重刷时不弹确认框", ui.LastFlashPlan == null, "不该弹确认框");
 
             OperationResult reflash = flow.FlashCurrent(scan, BoardRole.Boat, false, true);

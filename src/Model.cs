@@ -276,6 +276,9 @@ namespace BoatTool
         public FirmwareState State = FirmwareState.Unresponsive;
         public string Reason = "";
         public string ExpectedFwid = "";
+        // 身份 FWID 匹配，但固件库里同 FWID 存在不同镜像哈希的条目：
+        // 板上镜像内容未核验，不能宣称“已是所选镜像”。
+        public bool ImageUnverified;
 
         public string StateText
         {
@@ -299,7 +302,15 @@ namespace BoatTool
         // 旧程序即使写着 STEER=20、配对协议为 2，只要没有 FWID 或 FWID 不同，就必须升级。
         public static FirmwareCheck Check(BoardIdentity id, FirmwareSpec spec)
         {
+            return Check(id, spec, false);
+        }
+
+        // imageAmbiguous：固件库中存在同角色、同 FWID、不同应用哈希的条目
+        //（由 Workflow 用 library 检测后传入；VersionPolicy 保持无库依赖）。
+        public static FirmwareCheck Check(BoardIdentity id, FirmwareSpec spec, bool imageAmbiguous)
+        {
             FirmwareCheck check = new FirmwareCheck();
+            check.ImageUnverified = imageAmbiguous;
             check.ExpectedFwid = spec == null ? "" : spec.Fwid;
 
             if (id == null || string.IsNullOrEmpty(id.Mac))

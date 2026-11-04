@@ -29,20 +29,12 @@ namespace BoatTool
             if (File.Exists(paths.PresetPath))
             {
                 preset = PresetConfig.Load(paths.PresetPath);
-                // 按 preset 声明的套装 ID 找对应套装，而不是取“第一个可用套装”：
-                // 固件库里同时有 r10 和 r11 时，目录顺序会把 r10 排在前，按序号取会误判。
-                FirmwareSuite target = null;
-                if (!string.IsNullOrEmpty(preset.SuiteId))
-                {
-                    foreach (FirmwareSuite s in library.Suites)
-                        if (string.Equals(s.Id, preset.SuiteId, StringComparison.OrdinalIgnoreCase))
-                        { target = s; break; }
-                }
-                if (target == null)
-                {
-                    foreach (FirmwareSuite s in library.Suites) if (s.Usable) { target = s; break; }
-                }
-                preset.CrossCheck(target);
+                // preset 只约束角色与 MAC；suite_id/FWID 是推荐信息。
+                // 推荐套装存在 → 对“那套本身”核对打包一致性（防止打包时 preset 与清单写错）。
+                // 推荐套装不存在 → 只提示重新选择，绝不回退到“第一个可用套装”冒充正确选择，
+                //   也不因此禁用工具（用户可以选任何有效版本）。
+                FirmwareSuite recommended = string.IsNullOrEmpty(preset.SuiteId) ? null : library.Find(preset.SuiteId);
+                if (recommended != null) preset.CrossCheck(recommended);
             }
 
             StringBuilder warn = new StringBuilder();

@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
+using System.Text;
 
 namespace BoatTool
 {
@@ -129,7 +130,7 @@ namespace BoatTool
     public class Workflow
     {
         private readonly AppPaths paths;
-        private readonly FirmwareLibrary library;
+        private FirmwareLibrary library;
         private readonly RoleStore roles;
         private readonly IBoardTransport transport;
         private readonly IClock clock;
@@ -196,6 +197,13 @@ namespace BoatTool
         }
 
         public FirmwareLibrary Library { get { return library; } }
+
+        // 刷新固件库后替换库对象；当前选择由调用方负责迁移或清除。
+        public void UpdateLibrary(FirmwareLibrary fresh)
+        {
+            library = fresh;
+            selectedSuite = null;
+        }
 
         // 用户是否已对“降到更低目标转速”做过一次明确确认。
         // 每次烧录都会重新确认，不会记住上一次；这个开关只用于界面说明。
@@ -303,7 +311,13 @@ namespace BoatTool
             FirmwareSpec spec = selectedSuite == null ? null : selectedSuite.SpecFor(scan.Identity.Role);
             if (spec == null) return note;
             if (string.Equals(scan.Identity.FirmwareId, spec.Fwid, StringComparison.Ordinal))
-                return "与所选套装一致，无需重复烧录";
+            {
+                // 身份一致不等于镜像一致：板上镜像内容没有读取证据，统一按未核验表述。
+                string note2 = "固件身份匹配，板上镜像内容未核验";
+                if (IsImageAmbiguous(scan.Identity.Role, scan.Identity))
+                    note2 += "（固件库里还存在同身份、不同镜像的套装）";
+                return note2;
+            }
 
             List<FirmwareSuite> owners = library == null
                 ? new List<FirmwareSuite>()
@@ -333,7 +347,27 @@ namespace BoatTool
         public FirmwareCheck CheckFirmware(PortScan scan, BoardRole role)
         {
             FirmwareSpec spec = selectedSuite == null ? null : selectedSuite.SpecFor(role);
-            return VersionPolicy.Check(scan == null ? null : scan.Identity, spec);
+            bool ambiguous = IsImageAmbiguous(role, scan == null ? null : scan.Identity);
+            return VersionPolicy.Check(scan == null ? null : scan.Identity, spec, ambiguous);
+        }
+
+        // 同角色、同 FWID 的已校验条目里，是否存在与所选套装应用镜像哈希不同的其它套装：
+        // 存在即“身份相同、镜像内容未核验”——板上 FWID 一致不能证明镜像一致。
+        public bool IsImageAmbiguous(BoardRole role, BoardIdentity identity)
+        {
+            if (identity == null || !identity.HasFirmwareId || identity.Role != role) return false;
+            if (selectedSuite == null || library == null) return false;
+            FirmwareSpec mine = selectedSuite.SpecFor(role);
+            if (mine == null || !string.Equals(identity.FirmwareId, mine.Fwid, StringComparison.Ordinal)) return false;
+            string myHash = FirmwareLibrary.ComputeFileHash(mine.AppPath);
+            foreach (FirmwareSuite other in library.AllWithFwid(role, identity.FirmwareId))
+            {
+                if (string.Equals(other.Id, selectedSuite.Id, StringComparison.OrdinalIgnoreCase)) continue;
+                FirmwareSpec otherSpec = other.SpecFor(role);
+                if (otherSpec == null || string.IsNullOrEmpty(otherSpec.AppPath)) continue;
+                if (FirmwareLibrary.ComputeFileHash(otherSpec.AppPath) != myHash) return true;
+            }
+            return false;
         }
 
         // 只按驱动描述排除明显非 ESP32 的串口；绝不按串口号或名字推断板子角色。
@@ -355,6 +389,84 @@ namespace BoatTool
 
         // 烧录当前板：默认不备份；备份是可选项；写入后强制校验并读回身份。
         // forceReflash 只表示"用户在套装已匹配时仍要求重刷"，不绕过任何安全校验。
+        // 烧录前复核：重新从磁盘加载该套装目录，比对清单版本与各角色应用镜像哈希。
+        // 只读磁盘，不碰串口。任何不一致都拒绝烧录（防“刷新后被替换”的场景）。
+        public static bool RevalidateSuite(FirmwareSuite suite, out string error)
+        {
+            error = "";
+            if (suite == null) { error = "套装为空"; return false; }
+            string suiteRoot = Path.GetDirectoryName(suite.CatalogDir.TrimEnd(Path.DirectorySeparatorChar));
+            if (string.IsNullOrEmpty(suiteRoot) || !Directory.Exists(suiteRoot))
+            { error = "套装目录已不存在：" + suiteRoot; return false; }
+            FirmwareSuite fresh;
+            try { fresh = FirmwareSuite.Load(suiteRoot); }
+            catch (Exception ex) { error = "重新加载失败：" + ex.Message; return false; }
+            if (fresh.Problems.Count > 0)
+            {
+                error = "重新加载后自检未通过：" + string.Join("；", fresh.Problems.ToArray());
+                return false;
+            }
+            // 与 GUI 刷新共用同一快照规则（SuiteImageStamp，逐镜像条目 + 清单 + 导入 + esptool）。
+            string oldStamp = FirmwareLibrary.SuiteImageStamp(suite);
+            string newStamp = FirmwareLibrary.SuiteImageStamp(fresh);
+            if (oldStamp != newStamp)
+            {
+                error = DescribeSnapshotDelta(suite, fresh);
+                return false;
+            }
+            return true;
+        }
+
+        // 两个快照的差异描述（给出尽量具体的原因；找不到单项差异时给汇总）。
+        private static string DescribeSnapshotDelta(FirmwareSuite oldSuite, FirmwareSuite fresh)
+        {
+            if (oldSuite.EsptoolHashSnapshot != fresh.EsptoolHashSnapshot)
+                return "烧录组件 esptool.exe 已被替换（与加载时快照不一致）";
+            if (oldSuite.ManifestHashSnapshot != fresh.ManifestHashSnapshot)
+                return "固件清单已变化（写入地址、路径、诊断契约或其它元数据）";
+            if (oldSuite.ImportHashSnapshot != fresh.ImportHashSnapshot)
+                return "导入记录已变化";
+            foreach (FirmwareSuite.ImageSnapshot oldImg in oldSuite.ImageSnapshots)
+            {
+                FirmwareSuite.ImageSnapshot newImg = null;
+                foreach (FirmwareSuite.ImageSnapshot cand in fresh.ImageSnapshots)
+                    if (cand.Role == oldImg.Role && cand.Kind == oldImg.Kind) { newImg = cand; break; }
+                string role = oldImg.Role == "BOAT" ? "小船" : "遥控器";
+                if (newImg == null)
+                    return role + " " + oldImg.Kind + " 镜像条目在刷新后消失";
+                if (newImg.Sha256 != oldImg.Sha256)
+                    return role + " " + oldImg.Kind + " 镜像内容已被替换（" + oldImg.RelPath + "）";
+                if (newImg.Offset != oldImg.Offset)
+                    return role + " " + oldImg.Kind + " 写入地址已变化（0x" + oldImg.Offset.ToString("X") +
+                           " → 0x" + newImg.Offset.ToString("X") + "）";
+                if (newImg.RelPath != oldImg.RelPath)
+                    return role + " " + oldImg.Kind + " 镜像路径已变化（" + oldImg.RelPath +
+                           " → " + newImg.RelPath + "）";
+                if (newImg.Length != oldImg.Length)
+                    return role + " " + oldImg.Kind + " 镜像长度已变化";
+            }
+            return "套装内容与加载时快照不一致";
+        }
+
+        // 供 GUI/测试计算镜像哈希（与 RevalidateSuite 使用同一实现）。
+        public static string FileHashForTest(string path)
+        {
+            return FileHash(path);
+        }
+
+        private static string FileHash(string path)
+        {
+            if (string.IsNullOrEmpty(path) || !File.Exists(path)) return "";
+            using (System.Security.Cryptography.SHA256 sha = System.Security.Cryptography.SHA256.Create())
+            using (FileStream fs = File.OpenRead(path))
+            {
+                byte[] h = sha.ComputeHash(fs);
+                StringBuilder sb = new StringBuilder(h.Length * 2);
+                foreach (byte b in h) sb.Append(b.ToString("x2"));
+                return sb.ToString();
+            }
+        }
+
         public OperationResult FlashCurrent(PortScan scan, BoardRole chosenRole, bool doBackup, bool forceReflash)
         {
             OperationResult result = new OperationResult();
@@ -369,6 +481,15 @@ namespace BoatTool
             if (!suite.Usable)
             {
                 result.Error = "所选固件套装自检未通过：" + string.Join("；", suite.Problems.ToArray());
+                return result;
+            }
+            // 烧录前再核对：套装文件可能在“刷新固件库”后被替换或损坏。
+            // 重新加载同一目录并与当前所选比对清单与镜像哈希；不一致即拒绝并要求重新选择。
+            string suiteRecheckError;
+            if (!RevalidateSuite(suite, out suiteRecheckError))
+            {
+                result.Error = "所选套装在烧录前复核失败，可能已被替换或损坏：" + suiteRecheckError +
+                               "。请刷新固件库并重新选择套装。";
                 return result;
             }
             if (scan == null || scan.Port == null) { result.Error = "没有选择串口"; return result; }
@@ -425,15 +546,20 @@ namespace BoatTool
                 return result;
             }
 
-            FirmwareCheck check = VersionPolicy.Check(identity, spec);
+            bool ambiguous = IsImageAmbiguous(role, identity);
+            FirmwareCheck check = VersionPolicy.Check(identity, spec, ambiguous);
             if (check.State == FirmwareState.Current && !forceReflash)
             {
+                // 身份匹配 != 镜像已核验：没有读取板上 Flash 的证据，不能宣称"完全一致"。
+                // 保持跳过写入（可选备份/重刷由用户决定），但提示必须如实。
                 result.Ok = true;
-                result.Summary = "这块板已经与所选套装【" + suite.DisplayName + "】完全一致（" + identity.SteeringText +
-                                 "，FWID " + identity.FirmwareId + "），无需重复烧录。";
-                result.Summary += Environment.NewLine + "如果确实要重刷，请勾选“即使已匹配也重刷”后再点“烧录当前板”。";
-                result.Step("固件身份一致：" + identity.FirmwareId);
-                roles.Remember(identity.Mac, role, port, "已是最新，未重写");
+                result.Summary = "固件身份匹配（" + identity.SteeringText + "，FWID " + identity.FirmwareId +
+                                 "），板上镜像内容未核验。本次未写入；如需确保使用所选文件，请勾选“即使已匹配也重刷”。";
+                if (ambiguous)
+                    result.Summary += Environment.NewLine +
+                        "注意：固件库里存在同身份、不同镜像内容的套装，仅凭串口身份不能确认板上运行的是哪一个。";
+                result.Step("固件身份一致（镜像内容未核验）：未写入");
+                roles.Remember(identity.Mac, role, port, "身份匹配未写入（镜像未核验）");
                 return result;
             }
             if (check.State == FirmwareState.Unresponsive || check.State == FirmwareState.NoSpec)
